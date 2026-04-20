@@ -1,0 +1,210 @@
+WARNING: No matching packages
+14:24:48  INFO  Found 90 .mat files
+14:24:48  INFO    train:  72 subjects
+14:24:48  INFO    val  :   9 subjects
+14:24:48  INFO    test :   9 subjects
+14:24:48  INFO    train  Subject_62    gender=female  21 clips
+14:24:48  INFO    train  Subject_19    gender=male    21 clips
+14:24:49  INFO    train  Subject_48    gender=female  21 clips
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  WARNING    Could not unwrap action cell in Subject_10, skipping. Final type: ndarray
+14:24:49  INFO    train  Subject_10    gender=female  0 clips
+14:24:49  INFO    train  Subject_75    gender=male    21 clips
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  WARNING    Could not unwrap action cell in Subject_7, skipping. Final type: ndarray
+14:24:50  INFO    train  Subject_7     gender=female  0 clips
+14:24:50  INFO    train  Subject_23    gender=male    21 clips
+14:24:50  INFO    train  Subject_33    gender=male    21 clips
+14:24:51  INFO    train  Subject_46    gender=male    21 clips
+14:24:51  INFO    train  Subject_39    gender=female  21 clips
+14:24:52  INFO    train  Subject_50    gender=female  21 clips
+14:24:52  INFO    train  Subject_52    gender=female  21 clips
+14:24:53  INFO    train  Subject_70    gender=female  21 clips
+14:24:53  INFO    train  Subject_27    gender=male    21 clips
+14:24:54  INFO    train  Subject_63    gender=female  21 clips
+14:24:54  INFO    train  Subject_6     gender=female  21 clips
+14:24:55  INFO    train  Subject_66    gender=female  21 clips
+14:24:55  INFO    train  Subject_73    gender=female  21 clips
+14:24:56  INFO    train  Subject_56    gender=female  21 clips
+14:24:56  INFO    train  Subject_60    gender=male    21 clips
+14:24:57  INFO    train  Subject_54    gender=female  21 clips
+14:24:58  INFO    train  Subject_87    gender=male    21 clips
+14:24:58  INFO    train  Subject_81    gender=female  21 clips
+14:24:59  INFO    train  Subject_67    gender=female  21 clips
+14:24:59  INFO    train  Subject_4     gender=male    21 clips
+14:24:59  INFO    train  Subject_17    gender=female  21 clips
+14:25:00  INFO    train  Subject_43    gender=male    21 clips
+14:25:00  INFO    train  Subject_74    gender=female  21 clips
+14:25:01  INFO    train  Subject_37    gender=male    21 clips
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  WARNING    Could not unwrap action cell in Subject_49, skipping. Final type: ndarray
+14:25:01  INFO    train  Subject_49    gender=female  0 clips
+14:25:01  INFO    train  Subject_65    gender=female  21 clips
+14:25:02  INFO    train  Subject_47    gender=male    21 clips
+14:25:02  INFO    train  Subject_45    gender=female  21 clips
+14:25:03  INFO    train  Subject_9     gender=female  21 clips
+14:25:04  INFO    train  Subject_51    gender=female  21 clips
+14:25:04  WARNING    Could not unwrap action cell in Subject_8, skipping. Final type: ndarray
+14:25:04  INFO    train  Subject_8     gender=female  20 clips
+14:25:04  INFO    train  Subject_20    gender=male    21 clips
+14:25:05  INFO    train  Subject_42    gender=male    21 clips
+14:25:05  INFO    train  Subject_30    gender=female  21 clips
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  WARNING    Could not unwrap action cell in Subject_26, skipping. Final type: ndarray
+14:25:06  INFO    train  Subject_26    gender=male    0 clips
+14:25:06  INFO    train  Subject_69    gender=female  21 clips
+14:25:07  INFO    train  Subject_71    gender=male    21 clips
+14:25:07  WARNING    Could not unwrap action cell in Subject_57, skipping. Final type: ndarray
+14:25:07  INFO    train  Subject_57    gender=female  20 clips
+14:25:08  INFO    train  Subject_16    gender=female  21 clips
+14:25:08  INFO    train  Subject_40    gender=female  21 clips
+14:25:09  INFO    train  Subject_76    gender=female  21 clips
+14:25:09  WARNING    Could not unwrap action cell in Subject_11, skipping. Final type: ndarray
+14:25:09  WARNING    Could not unwrap action cell in Subject_11, skipping. Final type: ndarray
+14:25:09  INFO    train  Subject_11    gender=male    19 clips
+14:25:10  INFO    train  Subject_24    gender=female  21 clips
+14:25:10  INFO    train  Subject_44    gender=female  21 clips
+14:25:11  INFO    train  Subject_55    gender=female  21 clips
+14:25:11  INFO    train  Subject_3     gender=male    21 clips
+14:25:12  INFO    train  Subject_80    gender=female  21 clips
+14:25:12  INFO    train  Subject_31    gender=male    21 clips
+14:25:13  INFO    train  Subject_14    gender=female  21 clips
+14:25:13  INFO    train  Subject_15    gender=male    21 clips
+14:25:14  INFO    train  Subject_64    gender=female  21 clips
+14:25:14  INFO    train  Subject_53    gender=female  21 clips
+14:25:15  INFO    train  Subject_84    gender=female  21 clips
+14:25:15  INFO    train  Subject_18    gender=male    21 clips
+14:25:16  INFO    train  Subject_85    gender=female  21 clips
+14:25:16  INFO    train  Subject_29    gender=male    21 clips
+14:25:17  INFO    train  Subject_77    gender=female  21 clips
+14:25:17  INFO    train  Subject_5     gender=male    21 clips
+14:25:18  INFO    train  Subject_28    gender=male    21 clips
+14:25:18  INFO    train  Subject_1     gender=male    21 clips
+14:25:18  INFO    train  Subject_88    gender=female  21 clips
+14:25:19  INFO    train  Subject_61    gender=female  21 clips
+14:25:19  INFO    train  Subject_86    gender=female  21 clips
+14:25:20  INFO    train  Subject_58    gender=female  21 clips
+14:25:21  INFO    train  Subject_90    gender=female  21 clips
+14:25:21  INFO    train  Subject_32    gender=female  21 clips
+14:25:22  INFO    train  Subject_79    gender=female  21 clips
+14:25:22  INFO    val    Subject_68    gender=female  21 clips
+14:25:23  INFO    val    Subject_36    gender=male    22 clips
+14:25:23  INFO    val    Subject_34    gender=female  21 clips
+14:25:24  INFO    val    Subject_82    gender=female  21 clips
+14:25:24  INFO    val    Subject_89    gender=female  21 clips
+14:25:25  INFO    val    Subject_13    gender=male    21 clips
+14:25:25  INFO    val    Subject_59    gender=female  21 clips
+14:25:26  INFO    val    Subject_78    gender=female  21 clips
+14:25:26  INFO    val    Subject_2     gender=female  21 clips
+14:25:27  INFO    test   Subject_72    gender=female  21 clips
+14:25:27  INFO    test   Subject_21    gender=female  21 clips
+14:25:27  INFO    test   Subject_25    gender=female  21 clips
+14:25:28  INFO    test   Subject_35    gender=male    21 clips
+14:25:29  INFO    test   Subject_38    gender=female  21 clips
+14:25:29  WARNING    Could not unwrap action cell in Subject_41, skipping. Final type: ndarray
+14:25:29  INFO    test   Subject_41    gender=male    20 clips
+14:25:30  WARNING    Could not unwrap action cell in Subject_12, skipping. Final type: ndarray
+14:25:30  INFO    test   Subject_12    gender=female  20 clips
+14:25:30  INFO    test   Subject_22    gender=male    21 clips
+14:25:31  INFO    test   Subject_83    gender=female  21 clips
+14:25:31  INFO  
+=== Done ===
+14:25:31  INFO    train : 1424 clips
+14:25:31  INFO    val   :  190 clips
+14:25:31  INFO    test  :  187 clips
+14:25:31  INFO    total : 1801 clips  (0 skipped)
+14:25:31  INFO    file  : movi.h5  (347.2 MB)
+14:25:31  INFO  
+  /train/  (1424 clips)
+14:25:31  INFO      poses : shape=(261, 52, 3)  dtype=float32
+14:25:31  INFO      trans : shape=(261, 3)  dtype=float32
+14:25:31  INFO      betas : shape=(16,)  dtype=float32
+14:25:31  INFO      attrs: {'action': 'checking_watch', 'age': 27, 'framerate': 120, 'gender': 'male', 'height': 178, 'mass': 90, 'n_frames': 261, 'split': 'train', 'subject': 'Subject_11'}
+14:25:31  INFO  
+  /val/  (190 clips)
+14:25:31  INFO      poses : shape=(521, 52, 3)  dtype=float32
+14:25:31  INFO      trans : shape=(521, 3)  dtype=float32
+14:25:31  INFO      betas : shape=(16,)  dtype=float32
+14:25:31  INFO      attrs: {'action': 'checking_watch', 'age': 26, 'framerate': 120, 'gender': 'male', 'height': 178, 'mass': 77, 'n_frames': 521, 'split': 'val', 'subject': 'Subject_13'}
+14:25:31  INFO  
+  /test/  (187 clips)
+14:25:31  INFO      poses : shape=(369, 52, 3)  dtype=float32
+14:25:31  INFO      trans : shape=(369, 3)  dtype=float32
+14:25:31  INFO      betas : shape=(16,)  dtype=float32
+14:25:31  INFO      attrs: {'action': 'checking_watch', 'age': 26, 'framerate': 120, 'gender': 'female', 'height': 162, 'mass': 68, 'n_frames': 369, 'split': 'test', 'subject': 'Subject_12'}
