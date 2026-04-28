@@ -9,7 +9,7 @@ __pycache__/
 *.mp4
 *.npz
 *.pkl
-
+*.avi
 # other
 .vscode
 
