@@ -70,6 +70,8 @@ def file_name(file_type, id):
         return f"F_PG2_Subject_{id}_L.avi"
     elif file_type == 'v3d':
         return f"F_v3d_Subject_{id}.mat"
+    else:
+        raise Exception("Unrecognized file type")
 
 def _unwrap(x):
     """
@@ -180,7 +182,7 @@ def load_amass_mat(path: Path) -> tuple[dict, list[dict]] | tuple[None, None]:
 
 def load_clip_video(video_path, action_names, action_inds, fps=30):
     try:
-        vr = VideoReader(video_path, ctx=cpu(0))
+        vr = VideoReader(str(video_path), ctx=cpu(0))
     except Exception as e:
         log.warning(f"Cannot load {video_path.name}: {e}")
         return None, None
@@ -243,6 +245,8 @@ def write_clip(
 ) -> None:
     """Write one action clip into an HDF5 group."""
     # Handle duplicate action names (some subjects repeat an action)
+    # TODO: Currently writing PG1 and PG2 in the same observation, but will treat as different during training as 
+    # lifted from different angles. Worth considering to adress here or in the data loader? 
     unique_name = name
     counter = 1
     while unique_name in grp:
@@ -336,6 +340,8 @@ def main():
                 v3d_path = Path(f'{args.v3d_dir}/{file_name("v3d",id)}')
                 pg1_path = Path(f'{args.pg1_dir}/{file_name("pg1",id)}')
                 pg2_path = Path(f'{args.pg2_dir}/{file_name("pg2",id)}')
+                # print(str(v3d_path))
+                # raise Exception()
                 
 
                 meta, clips = load_amass_mat(mat_path)
@@ -395,7 +401,8 @@ def main():
                         skipped.append(id)
                         continue
                     if clip["action"] != action_names[i]:
-                        raise Exception(f'Actions are not in the right order, subject {id} has issues')
+                        log.info(f'Actions are not in the right order, subject {id} has issues')
+                        skipped.append(id)
                     
                     clip["pg1"] = pg1_clips[i]
                     clip["pg2"] = pg2_clips[i]
