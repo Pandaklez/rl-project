@@ -112,6 +112,7 @@ def main():
             lifted_processed = {}
 
             for camera in ("pg1", "pg2"):
+                # TODO: handle missing lifted data when one camera is missing... 
                 lifted_normalized = normalize_clip(grp_lifted[camera][clip_name], clip_name, norm_stats)
                 poses_up, trans_up = upsample(lifted_normalized["poses"], lifted_normalized["trans"],T=grp_movi[clip_name].attrs.get("n_frames"))
                 lifted_processed[camera] = {
