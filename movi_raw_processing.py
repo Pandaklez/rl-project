@@ -19,8 +19,8 @@ HDF5 layout:
     │   │   ├── poses   (T, 52, 3)
     │   │   ├── trans   (T,  3)
     │   │   ├── betas   (16,)
-            ├── PG1     (T/4,H,W,3)
-            ├── PG2     (T/4,H,W,3)
+    |   |   ├── PG1     (T/4,H,W,3)
+    |   |   ├── PG2     (T/4,H,W,3)
     │   │   └── attrs:  gender, action, subject, height, mass, age,
     │   │               framerate, n_frames, split
     │   └── ...
