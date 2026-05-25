@@ -336,12 +336,15 @@ def main():
             grp = h5f.require_group(split)
 
             for id in subjs:
-                mat_path = Path(f'{args.mat_dir}/{file_name("mat",id)}')
-                v3d_path = Path(f'{args.v3d_dir}/{file_name("v3d",id)}')
-                pg1_path = Path(f'{args.pg1_dir}/{file_name("pg1",id)}')
-                pg2_path = Path(f'{args.pg2_dir}/{file_name("pg2",id)}')
-                # print(str(v3d_path))
-                # raise Exception()
+                # mat_path = Path(f'{args.mat_dir}/{file_name("mat",id)}')
+                # v3d_path = Path(f'{args.v3d_dir}/{file_name("v3d",id)}')
+                # pg1_path = Path(f'{args.pg1_dir}/{file_name("pg1",id)}')
+                # pg2_path = Path(f'{args.pg2_dir}/{file_name("pg2",id)}')
+                mat_path = Path(args.mat_dir)/Path(file_name("mat",id))
+                v3d_path = Path(args.v3d_dir)/Path(file_name("v3d",id))
+                pg1_path = Path(args.pg1_dir)/Path(file_name("pg1",id))
+                pg2_path = Path(args.pg2_dir)/Path(file_name("pg2",id))
+
                 
 
                 meta, clips = load_amass_mat(mat_path)
