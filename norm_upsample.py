@@ -112,23 +112,34 @@ def main():
             lifted_processed = {}
 
             for camera in ("pg1", "pg2"):
-                # TODO: handle missing lifted data when one camera is missing... 
+                if camera not in grp_lifted or clip_name not in grp_lifted[camera]:
+                    print(f"Skipping missing lifted data for {split}/{camera}/{clip_name}")
+                    continue
+
                 lifted_normalized = normalize_clip(grp_lifted[camera][clip_name], clip_name, norm_stats)
-                poses_up, trans_up = upsample(lifted_normalized["poses"], lifted_normalized["trans"],T=grp_movi[clip_name].attrs.get("n_frames"))
+                poses_up, trans_up = upsample(
+                    lifted_normalized["poses"],
+                    lifted_normalized["trans"],
+                    T=grp_movi[clip_name].attrs.get("n_frames")
+                )
                 lifted_processed[camera] = {
-                    "poses": poses_up, 
+                    "poses": poses_up,
                     "trans": trans_up,
                     "betas": lifted_normalized["betas"]
                 }
+
+            if not lifted_processed:
+                print(f"Skipping: {split}/{clip_name}, no lifted data found")
+                continue
             g = grp_out.create_group(clip_name)
             for key, value in grp_movi[clip_name].attrs.items():
                 g.attrs[key] = value
             for key in ("poses", "trans", "betas"):
-                g.create_dataset(key, data=movi_processed[key], compression="gzip",compression_opts=4,chunks=True)
-            for camera in ("pg1", "pg2"):
+                g.create_dataset(key, data=movi_processed[key], compression="gzip", compression_opts=4, chunks=True)
+            for camera, camera_data in lifted_processed.items():
                 cam_grp = g.create_group(camera)
                 for key in ("poses", "trans", "betas"):
-                    cam_grp.create_dataset(key, data=lifted_processed[camera][key], compression="gzip",compression_opts=4,chunks=True)
+                    cam_grp.create_dataset(key, data=camera_data[key], compression="gzip", compression_opts=4, chunks=True)
 
 
 
