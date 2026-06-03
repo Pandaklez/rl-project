@@ -10,8 +10,26 @@ __pycache__/
 *.npz
 *.pkl
 *.avi
+*.pth
+*.zip
+/output/
+/demo/
+*.mat
+*.jpg
+*.jpeg
+*.png
+/data/
+/common/utils/human_model_files
+/pretrained_models/
+/.claude/
+/F_Subjects_meta/
 # other
 .vscode
+*.npy
+*.err
+*.log
+PG1_avi.zip
+PG2_avi.zip
 
 # C extensions
 *.so
@@ -226,3 +244,28 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# 3D lifting utils
+transformer_utils/
+./transformer_utils/
+/transformer_utils/
+transformer_utils
+
+# From SMPLer-X
+__pycache__/
+common/utils/human_model_files
+pretrained_models/
+dataset
+output
+.vscode
+*.npy
+*.tar
+main/vis
+main/vis*
+tool/AGORA/vis*
+tool/SHAPY/vis*
+demo/
+*egg-info/
+.idea/
+data/SHAPY/mesh-mesh-intersection/build/
+data/SHAPY/mesh-mesh-intersection/mesh_mesh_intersect_cuda.cpython-38-x86_64-linux-gnu.so
