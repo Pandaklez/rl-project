@@ -73,6 +73,7 @@ class MoViDataset(Dataset):
 
     def __getitem__(self, idx):
         clip_name, camera = self.samples[idx]
+        # NOTE: Flatten and replace with poses_x, trans_x etc...
         data = {
             "x": {},
             "y": {}

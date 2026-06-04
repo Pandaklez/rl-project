@@ -6,7 +6,7 @@ import torch.nn.functional as F
 
 class MoviEnv:
 
-    def __init__(self, device="cpu", keys = ("poses", "trans", "betas")):
+    def __init__(self, device="cpu", keys = ("poses", "trans")):
         # NOTE states and actions as dicts?
         # NOTE how to handle reward, add env-native reward here in the class and if adding GAN-loss this needs to 
         # be added in the RL training loop as reward weights change through training.
@@ -16,7 +16,7 @@ class MoviEnv:
         self.done = False
 
     def reset(self, init_state):
-
+        # NOTE: either just tuple, or flatten like poses_lifted, trans_corrected etc...
         self.state = {
             "lifted_state" : {
                 key: torch.from_numpy(init_state[key]).to(self.device) for key in self.keys

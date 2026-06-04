@@ -63,20 +63,25 @@ def upsample(poses, trans, T):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--movi_path",    required=True,
+    parser.add_argument("--movi_path",     default = "Gmovi.h5",
                         help="Directory containing GT poses, trans, betas and attrs")
-    parser.add_argument("--lifted_path",   required=True,
+    parser.add_argument("--lifted_path",   default = "lifted_movi_part1_upd1.h5",
                         help="Directory containing lifted poses from pg1 and pg2")
-    parser.add_argument("--norm_path",   required=True,
-                        help="Path to json file containing normalization stats (e.g., mean and std of pose and trans")
-    parser.add_argument("--out_hdf5",   required=True,
+    parser.add_argument("--gt_norm_path",   default = "normalization.json",
+                        help="Path to json file containing normalization stats for gt (e.g., mean and std of pose and trans)")
+    parser.add_argument("--pg1_norm_path",   default = "normalization_lifted_pg1.json",
+                        help="Path to json file containing normalization stats for pg1 (e.g., mean and std of pose and trans)")
+    parser.add_argument("--pg2_norm_path",   default = "normalization_lifted_pg2.json",
+                        help="Path to json file containing normalization stats for pg2 (e.g., mean and std of pose and trans)")
+    parser.add_argument("--out_hdf5",   default = "processed_movi.h5",
                         help="Output path, e.g. processed_data.h5")
+                        
     
     args = parser.parse_args()
 
     movi_h5 = h5py.File(args.movi_path, "r")
     lifted_h5 = h5py.File(args.lifted_path, "r")
-    norm_stats = json.load(open(args.norm_path, "r"))
+    norm_stats = json.load(open(args.gt_norm_path, "r"))
 
     out_file = h5py.File(args.out_hdf5, "w")
 
@@ -104,6 +109,7 @@ def main():
         print(f"Processing split {split}...")
         grp_movi = movi_h5[split]
         grp_lifted = lifted_h5[split]
+        
         grp_out = out_file.require_group(split)
 
         for clip_name in grp_movi.keys():
