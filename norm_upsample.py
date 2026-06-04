@@ -10,9 +10,9 @@ def normalize_clip(clip,clip_name,norm_stats):
     for key in ("poses", "trans", "betas"):
         if key not in clip:
             raise ValueError(f"Missing key {key} in clip {clip_name}")
-        mu = norm_stats[key]["mu"]
-        sigma = norm_stats[key]["sigma"]
-        normalized[key] = (clip[key] - mu) / sigma
+        mu = np.array(norm_stats[key]["mu"])
+        sigma = np.array(norm_stats[key]["sigma"])
+        normalized[key] = (clip[key][:] - mu) / sigma
     return normalized
 
 
@@ -81,7 +81,9 @@ def main():
 
     movi_h5 = h5py.File(args.movi_path, "r")
     lifted_h5 = h5py.File(args.lifted_path, "r")
-    norm_stats = json.load(open(args.gt_norm_path, "r"))
+    gt_norm_stats = json.load(open(args.gt_norm_path, "r"))
+    pg1_norm_stats = json.load(open(args.pg1_norm_path, "r"))
+    pg2_norm_stats = json.load(open(args.pg2_norm_path, "r"))
 
     out_file = h5py.File(args.out_hdf5, "w")
 
@@ -113,7 +115,7 @@ def main():
         grp_out = out_file.require_group(split)
 
         for clip_name in grp_movi.keys():
-            movi_processed = normalize_clip(grp_movi[clip_name], clip_name, norm_stats)
+            movi_processed = normalize_clip(grp_movi[clip_name], clip_name, gt_norm_stats)
             
             lifted_processed = {}
 
@@ -121,6 +123,11 @@ def main():
                 if camera not in grp_lifted or clip_name not in grp_lifted[camera]:
                     print(f"Skipping missing lifted data for {split}/{camera}/{clip_name}")
                     continue
+
+                if camera == "pg1":
+                    norm_stats = pg1_norm_stats
+                else:
+                    norm_stats = pg2_norm_stats
 
                 lifted_normalized = normalize_clip(grp_lifted[camera][clip_name], clip_name, norm_stats)
                 poses_up, trans_up = upsample(
