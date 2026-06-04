@@ -3,6 +3,10 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Notebooks for quick checks
+*.ipynb
+*.ipynb_checkpoints
+
 # Data
 *.h5
 *.mat
