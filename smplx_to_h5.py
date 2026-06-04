@@ -8,11 +8,18 @@ HDF5 layout:
     movi_smplx.h5
     ├── train/
     │   ├── Subject_1__walking/
-    │   │   ├── poses  (T, 52, 3)  float32  axis-angle [root|body|lhand|rhand]
-    │   │   ├── trans  (T,  3)     float32  root translation
-    │   │   ├── betas  (16,)       float32  mean shape, zero-padded to 16
-    │   │   └── attrs: gender, action, subject, height, mass, age,
-    │   │               framerate, n_frames, split
+    │   │   ├──PG1 
+    │   │   │   ├──poses  (T, 52, 3)  float32  axis-angle [root|body|lhand|rhand]
+    │   │   │   ├──trans  (T,  3)     float32  root translation
+    │   │   │   ├──betas  (16,)       float32  mean shape, zero-padded to 16
+    │   │   │   ├──attrs: gender, action, subject, height, mass, age,
+    │   │           framerate, n_frames, split
+    |   │   ├──PG2 ...
+    |   |   │   ├──poses  (T, 52, 3)  float32  axis-angle [root|body|lhand|rhand]
+    │   │   │   ├──trans  (T,  3)     float32  root translation
+    │   │   │   ├──betas  (16,)      float32  mean shape, zero-padded to 16
+    │   │   │   ├──attrs: gender, action, subject, height, mass, age,
+    │   │           framerate, n_frames, split
     │   └── ...
     ├── val/  ...
     └── test/ ...
@@ -208,21 +215,19 @@ def build_clip_arrays(frame_map: dict[int, Path], start: int, end: int):
 # HDF5 writer
 # ─────────────────────────────────────────────────────────────────────────────
 
-def write_clip(split_grp: h5py.Group, name: str, poses, trans, betas,
+def write_clip(split_grp: h5py.Group, name: str, pg_group: str, poses, trans, betas,
                poses_vel, trans_vel, meta: dict, action: str, split: str,
                norms: dict | None = None) -> None:
-    # deduplicate name if already present
-    unique = name
-    counter = 1
-    while unique in split_grp:
-        unique = f"{name}__{counter}"
-        counter += 1
-    g = split_grp.create_group(unique)
+    clip_grp = split_grp.require_group(name)
+    if pg_group in clip_grp:
+        log.warning(f"  {name}/{pg_group} already exists, skipping duplicate")
+        return
+    g = clip_grp.create_group(pg_group)
 
-    if norms is not None:
-        poses = normalize(poses, *norms["poses"])
-        trans = normalize(trans, *norms["trans"])
-        betas = normalize(betas, *norms["betas"])
+    # if norms is not None:
+    #     poses = normalize(poses, *norms["poses"])
+    #     trans = normalize(trans, *norms["trans"])
+    #     betas = normalize(betas, *norms["betas"])
 
     for key, data in (("poses", poses), ("trans", trans), ("betas", betas),
                       ("poses_vel", poses_vel), ("trans_vel", trans_vel)):
@@ -261,7 +266,7 @@ def main():
 
     norms = load_norm(args.norm_json) if args.norm_json else None
     if norms:
-        log.info(f"Normalization loaded from {args.norm_json}")
+        log.info(f"dozation loaded from {args.norm_json}")
 
     with open(args.split_index) as f:
         split_index: dict[str, list[str]] = json.load(f)
@@ -302,6 +307,10 @@ def main():
 
         for vid_dir in video_dirs:
             video_name = vid_dir.name  # e.g. F_PG1_Subject_66_L
+
+            # parse PG group
+            m_pg = re.search(r"(PG\d+)", video_name)
+            pg_group = m_pg.group(1) if m_pg else "PG_unknown"
 
             # parse subject id
             m = re.search(r"Subject_(\d+)", video_name)
@@ -356,10 +365,10 @@ def main():
                     skipped += 1
                     continue
 
-                write_clip(h5f[split], clip_name, poses, trans, betas,
+                write_clip(h5f[split], clip_name, pg_group, poses, trans, betas,
                            poses_vel, trans_vel, meta, action, split, norms)
                 counts[split] += 1
-                log.debug(f"  {split:5s}  {clip_name}  T={poses.shape[0]}")
+                log.debug(f"  {split:5s}  {clip_name}/{pg_group}  T={poses.shape[0]}")
 
     # ── Summary ──────────────────────────────────────────────────────────────
     total    = sum(counts.values())
@@ -373,10 +382,13 @@ def main():
 
     with h5py.File(args.out, "r") as h5f:
         for split in ("train", "val", "test"):
-            keys = list(h5f[split].keys())
-            log.info(f"\n  /{split}/  ({len(keys)} clips)")
-            if keys:
-                ex = h5f[split][keys[0]]
+            clip_keys = list(h5f[split].keys())
+            log.info(f"\n  /{split}/  ({len(clip_keys)} clips)")
+            if clip_keys:
+                clip = h5f[split][clip_keys[0]]
+                pg_keys = list(clip.keys())
+                log.info(f"    PG groups: {pg_keys}")
+                ex = clip[pg_keys[0]]
                 for ds in ("poses", "trans", "betas", "poses_vel", "trans_vel"):
                     log.info(f"    {ds:10s}: shape={ex[ds].shape}  dtype={ex[ds].dtype}")
                 log.info(f"    attrs: {dict(ex.attrs)}")

@@ -17,6 +17,8 @@ from typing import Literal, Union
 from mmdet.apis import init_detector, inference_detector
 from common.utils.inference_utils import process_mmdet_results, non_max_suppression
 
+
+#  bash /home/annkle/rl-project/smpler-x-main/batch_inference.sh > /home/annkle/rl-project/batch_inference.log 2>&1
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_gpus', type=int, dest='num_gpus')

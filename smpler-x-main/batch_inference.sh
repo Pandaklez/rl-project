@@ -46,7 +46,7 @@ for VIDEO_DIR in "${VIDEO_DIRS[@]}"; do
         echo "  frames: $end_count"
 
         mkdir -p "$SAVE_DIR"
-        conda run -n "$CONDA_ENV" python inference.py \
+        if conda run -n "$CONDA_ENV" python inference.py \
             --num_gpus    "$NUM_GPUS" \
             --exp_name    "output/demo_${VIDEO_NAME}" \
             --pretrained_model "$CKPT_NAME" \
@@ -55,9 +55,15 @@ for VIDEO_DIR in "${VIDEO_DIRS[@]}"; do
             --start       1 \
             --end         "$end_count" \
             --output_folder "$SAVE_DIR" \
-            --no_render
+            --no_render; then
+            echo "  done -> $SMPLX_DIR"
+        else
+            echo "  [ERROR] inference failed for $VIDEO_NAME, skipping"
+            rm -rf "$SAVE_DIR"
+        fi
 
-        echo "  done -> $SMPLX_DIR"
+        # free disk space — frames are no longer needed once results are saved
+        rm -rf "$IMG_PATH"
     done
 done
 
