@@ -12,10 +12,29 @@ __pycache__/
 *.mat
 *.mp4
 *.npz
+*.npy
 *.pkl
 *.avi
+*.zip
+*.jpg
 # other
 .vscode
+
+/data/
+data/*
+demo/*
+.claude/*
+.claude/
+output/
+
+# models
+*.pth
+pretrained_models/
+transformer_utils/
+
+# 3D lifting 
+smpler-x-main/
+smpler-x-main/*
 
 # C extensions
 *.so
