@@ -16,10 +16,12 @@ __pycache__/
 *.pkl
 *.avi
 *.zip
+*.tar
 *.jpg
 # other
 .vscode
 
+checkpoints/
 /data/
 data/*
 demo/*
