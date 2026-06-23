@@ -36,6 +36,8 @@ Usage:
         --seed       42
 """
 
+from __future__ import annotations
+
 import argparse
 import logging
 import random
@@ -44,7 +46,11 @@ from pathlib import Path
 import h5py
 import numpy as np
 import scipy.io as sio
-from decord import VideoReader, cpu
+try:
+    from decord import VideoReader, cpu
+    _DECORD_AVAILABLE = True
+except ImportError:
+    _DECORD_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -85,7 +91,7 @@ def _unwrap(x):
     return x
 
 
-def _scalar(x) -> int | float:
+def _scalar(x):
     """Extract a Python scalar from any numpy array shape."""
     if isinstance(x, np.ndarray):
         return x.flat[0].item()
@@ -113,7 +119,7 @@ def load_v3d_mat(v3d_path):
 
     return action_names, action_inds
 
-def load_amass_mat(path: Path) -> tuple[dict, list[dict]] | tuple[None, None]:
+def load_amass_mat(path: Path):
     """
     Load one F_amass_Subject_X.mat.
 
@@ -254,14 +260,11 @@ def write_clip(
         counter += 1
     g = grp.create_group(unique_name)
 
-    for key in ("poses", "trans", "betas","pg1","pg2"):
-        g.create_dataset(
-            key,
-            data             = clip[key], 
-            compression      = "gzip",
-            compression_opts = 4,
-            chunks           = True,
-        )
+    for key in ("poses", "trans", "betas"):
+        g.create_dataset(key, data=clip[key], compression="gzip", compression_opts=4, chunks=True)
+    for key in ("pg1", "pg2"):
+        if clip.get(key) is not None:
+            g.create_dataset(key, data=clip[key], compression="gzip", compression_opts=4, chunks=True)
 
     # Attach everything the DataLoader might want without loading arrays
     g.attrs["action"]    = clip["action"]
@@ -283,14 +286,19 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--mat_dir",    required=True,
                         help="Directory containing F_amass_Subject_*.mat files")
-    parser.add_argument("--pg1_dir",    required=True,
+    parser.add_argument("--pg1_dir",    default=None,
                         help="Directory containing F_PG1_Subject_*_L.avi files")
-    parser.add_argument("--pg2_dir",    required=True,
+    parser.add_argument("--pg2_dir",    default=None,
                         help="Directory containing F_PG2_Subject_*_L.avi files")
     parser.add_argument("--v3d_dir",    required=True,
                         help="Directory containing F_v3d_Subject_*.mat files")
+    parser.add_argument("--skip_video", action="store_true",
+                        help="Skip video loading; write only GT poses/trans/betas")
     parser.add_argument("--out_hdf5",   required=True,
                         help="Output path, e.g. movi.h5")
+    parser.add_argument("--split_index", default=None,
+                        help="JSON with pre-defined {'train':[], 'val':[], 'test':[]} clip names. "
+                             "If given, overrides train_frac/val_frac/seed.")
     parser.add_argument("--train_frac", type=float, default=0.80)
     parser.add_argument("--val_frac",   type=float, default=0.10)
     parser.add_argument("--seed",       type=int,   default=42)
@@ -300,13 +308,25 @@ def main():
 
     subjects = [id for id in range(1,100) if id not in NO_DATA_SUBJECTS]
 
-    # mat_dir = Path(args.mat_dir)
-    # mat_files = sorted(mat_dir.glob("F_amass_Subject_*.mat"))
-    # if not mat_files:
-    #     raise FileNotFoundError(f"No F_amass_Subject_*.mat files in {mat_dir}")
-    # log.info(f"Found {len(mat_files)} .mat files")
-
-    splits = subject_split(subjects, args.train_frac, args.val_frac, args.seed)
+    if args.split_index:
+        import json
+        with open(args.split_index) as f:
+            clip_index = json.load(f)
+        # Derive subject-level splits from clip names (Subject_X__action → X)
+        def subj_ids(clip_names):
+            ids = set()
+            for name in clip_names:
+                try:
+                    ids.add(int(name.split("__")[0].split("_")[1]))
+                except (IndexError, ValueError):
+                    pass
+            return sorted(ids)
+        splits = {s: subj_ids(clip_index[s]) for s in ("train", "val", "test")}
+        log.info("Using split_index.json for subject splits")
+        for s, ids in splits.items():
+            log.info(f"  {s}: {len(ids)} subjects")
+    else:
+        splits = subject_split(subjects, args.train_frac, args.val_frac, args.seed)
     counts = {"train": 0, "val": 0, "test": 0}
     skipped = []
 
@@ -342,8 +362,6 @@ def main():
                 # pg2_path = Path(f'{args.pg2_dir}/{file_name("pg2",id)}')
                 mat_path = Path(args.mat_dir)/Path(file_name("mat",id))
                 v3d_path = Path(args.v3d_dir)/Path(file_name("v3d",id))
-                pg1_path = Path(args.pg1_dir)/Path(file_name("pg1",id))
-                pg2_path = Path(args.pg2_dir)/Path(file_name("pg2",id))
 
                 
 
@@ -375,30 +393,26 @@ def main():
                     )
                     continue
 
-                # TODO read videos.
-                pg1_clips, pg1_n_frames = load_clip_video(pg1_path,action_names,action_inds)
-                pg2_clips, pg2_n_frames = load_clip_video(pg2_path,action_names,action_inds)
-                if (pg1_clips is None) or (pg2_clips is None):
-                    skipped.append(id)
-                    log.info(
-                        f"Skipping Subject {id}, issue reading video"
-                    )
-                    continue
-                if pg1_n_frames != pg2_n_frames:
-                    skipped.append(id)
-                    log.info(
-                        f"Skipping Subject {id}, trimmed videos of different length"
-                    )
-                    continue
-                # Success
+                if not args.skip_video:
+                    pg1_path = Path(args.pg1_dir)/Path(file_name("pg1",id))
+                    pg2_path = Path(args.pg2_dir)/Path(file_name("pg2",id))
+                    pg1_clips, pg1_n_frames = load_clip_video(pg1_path,action_names,action_inds)
+                    pg2_clips, pg2_n_frames = load_clip_video(pg2_path,action_names,action_inds)
+                    if (pg1_clips is None) or (pg2_clips is None):
+                        skipped.append(id)
+                        log.info(f"Skipping Subject {id}, issue reading video")
+                        continue
+                    if pg1_n_frames != pg2_n_frames:
+                        skipped.append(id)
+                        log.info(f"Skipping Subject {id}, trimmed videos of different length")
+                        continue
+
                 log.info(
                     f"  {split:5s}  {meta['id']:12s}  "
                     f"gender={meta['gender']:6s}  {len(clips)} clips"
                 )
 
-
-
-                for i,clip in enumerate(clips):
+                for i, clip in enumerate(clips):
                     if clip["T"] < args.min_frames:
                         log.debug(f"    skip {clip['action']}: only {clip['T']} frames")
                         skipped.append(id)
@@ -406,16 +420,16 @@ def main():
                     if clip["action"] != action_names[i]:
                         log.info(f'Actions are not in the right order, subject {id} has issues')
                         skipped.append(id)
-                    
-                    clip["pg1"] = pg1_clips[i]
-                    clip["pg2"] = pg2_clips[i]
 
+                    if not args.skip_video:
+                        clip["pg1"] = pg1_clips[i]
+                        clip["pg2"] = pg2_clips[i]
+                    else:
+                        clip["pg1"] = None
+                        clip["pg2"] = None
 
-                    # Double-underscore separator avoids collisions with
-                    # action names that contain single underscores
                     action_safe = clip["action"].replace("/", "_").replace(" ", "_")
                     name = f"{meta['id']}__{action_safe}"
-                    
 
                     write_clip(grp, name, clip, meta, split)
                     counts[split] += 1
