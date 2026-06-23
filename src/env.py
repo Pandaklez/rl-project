@@ -52,6 +52,7 @@ class MoviEnv:
         return self.state
 
 
+# TODO: this metrics should be pulled from evaluate.py because we want the metrics to be the same
 def compute_reward(
     corrected:      dict[str, torch.Tensor],
     gt:             dict[str, torch.Tensor],
@@ -62,6 +63,7 @@ def compute_reward(
 ) -> float:
     reward = 0.0
     for key in ("poses", "trans"):
+        # TODO: add Procrustes-Aligned instead of raw RMSE for similarity
         rmse    = (corrected[key] - gt[key]).pow(2).mean().sqrt()
         reward -= w_similarity * rmse.item()
         # TODO: change it from velocity to acceleration 
