@@ -253,3 +253,4 @@ if __name__ == "__main__":
 
 
 # PA-MPJPE lifted (raw)  : 0.605  (147 clips)
+# original VS. lifted Vs. ppo updated Vs. GAIL + PPO

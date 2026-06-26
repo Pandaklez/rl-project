@@ -5,33 +5,39 @@ import json
 import numpy as np
 
 """
-Assuming data in h5_path is on the following format and already normalized:
+Expected HDF5 layout (produced by data/norm_upsample.py):
 
-final_dataset.h5
+processed_movi.h5
     ├── train/
     │   ├── Subject_1__walking/
-    │   │   ├── norm_poses   (T, 52, 3)
-    │   │   ├── norm_trans   (T,  3)
-    │   │   ├── norm_betas   (16,)
-    |   |   ├── norm_PG1/     
-    |   |   |   ├── norm_poses    (T,52,3)
-    |   |   |   ├── norm_trans    (T,3)
-    |   |   |   ├── norm_betas    (16,)
-    |   |   ├── norm_PG2/     
-    |   |   |   ├── norm_poses    (T,52,3)
-    |   |   |   ├── norm_trans    (T,3)
-    |   |   |   ├── norm_betas    (16,)
-    │   │   └── attrs:  gender, action, subject, height, mass, age,
+    │   │   ├── poses   (T, 52, 3)   — normalized GT axis-angle
+    │   │   ├── trans   (T,  3)      — normalized GT root translation
+    │   │   ├── betas   (16,)        — normalized GT shape coefficients
+    │   │   ├── pg1/
+    │   │   │   ├── poses  (T, 52, 3)  — normalized + upsampled lifted (PG1 camera)
+    │   │   │   ├── trans  (T,  3)
+    │   │   │   └── betas  (16,)
+    │   │   ├── pg2/
+    │   │   │   ├── poses  (T, 52, 3)
+    │   │   │   ├── trans  (T,  3)
+    │   │   │   └── betas  (16,)
+    │   │   └── attrs: gender, action, subject, height, mass, age,
     │   │               framerate, n_frames, split
     │   └── ...
     ├── val/  ...
     └── test/ ...
+
+Each sample returned by __getitem__ is a (clip_name, camera) pair:
+    {
+        "x": {"poses": (T,52,3), "trans": (T,3), "betas": (16,)}  — lifted input
+        "y": {"poses": (T,52,3), "trans": (T,3), "betas": (16,)}  — GT target
+    }
 """
 
-# NOTE: if decided that h_t i.e. recurrent component is needed, data set needs to be windowed in time 
+
 class MoViDataset(Dataset):
-    def __init__(self, h5_path, norm_stats_path, split="train", device="cpu", 
-                 cameras = ("pg1", "pg2"),keys = ("poses", "trans", "betas")):
+    def __init__(self, h5_path, norm_stats_path, split="train", device="cpu",
+                 cameras=("pg1", "pg2"), keys=("poses", "trans", "betas"), verbose=False):
         super().__init__()
         self.h5_path = h5_path
         self.norm_stats_path = norm_stats_path
@@ -41,46 +47,44 @@ class MoViDataset(Dataset):
         self.keys = keys
 
         self.samples = []
+        self.verbose = verbose
 
         with open(norm_stats_path, "r") as f:
             self.norm_stats = json.load(f)
 
         with h5py.File(h5_path, "r") as f:
             for clip_name in f[split].keys():
+                clip_grp = f[split][clip_name]
                 for camera in self.cameras:
-                    if camera in f[split] and clip_name in f[split][camera]:
+                    if camera in clip_grp:
                         self.samples.append((clip_name, camera))
-                    else:
-                        print(f"Warning: Missing lifted data for {split}/{camera}/{clip_name}, skipping")
+                    elif self.verbose:
+                        print(f"Warning: missing lifted data for {split}/{clip_name}/{camera}, skipping")
 
         self._len = len(self.samples)
 
     def __len__(self):
-        return self._len # NOTE: len is now returning the number of samples (clip-camera pairs) rather than just clips, i.e. not number of frames.
-    
+        return self._len
+
     def unscale(self, data_dict):
-        """
-        Unscale normalized data using the stored mean and std from norm_stats.
-        Expects data_dict to have the same keys as norm_stats ("poses", "trans", "betas").
-        """
+        """Invert normalization using stored mu/sigma stats."""
         unscaled = {}
         for key, stats in self.norm_stats.items():
             if key in data_dict:
-                unscaled[key] = data_dict[key] * stats["std"] + stats["mean"]
+                mu    = np.array(stats["mu"])
+                sigma = np.array(stats["sigma"])
+                sigma = np.where(sigma == 0, 1.0, sigma)
+                unscaled[key] = data_dict[key] * sigma + mu
             else:
-                raise ValueError(f"Key {key} not found in data_dict for unscaling")
+                raise ValueError(f"Key '{key}' not found in data_dict for unscaling")
         return unscaled
 
     def __getitem__(self, idx):
         clip_name, camera = self.samples[idx]
-        # NOTE: Flatten and replace with poses_x, trans_x etc...
-        data = {
-            "x": {},
-            "y": {}
-        }
+        data = {"x": {}, "y": {}}
         with h5py.File(self.h5_path, "r") as f:
-            clip_data = f[self.split][clip_name]
+            clip_grp = f[self.split][clip_name]
             for key in self.keys:
-                data["x"][key] = torch.from_numpy(clip_data[camera][key]).to(self.device)
-                data["y"][key] = torch.from_numpy(clip_data[key]).to(self.device)
-        return data 
+                data["x"][key] = torch.from_numpy(clip_grp[camera][key][:].astype(np.float32)).to(self.device)
+                data["y"][key] = torch.from_numpy(clip_grp[key][:].astype(np.float32)).to(self.device)
+        return data
