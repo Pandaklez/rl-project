@@ -57,6 +57,14 @@ def upsample(poses, trans, T):
 
     return poses_up, trans_up
 
+def create_split_index(data_file, index_out_file):
+    split_index = {}
+    for split in ["train", "val", "test"]:
+        split_index[split] = list(data_file[split].keys())
+
+    with open(index_out_file, "w") as file:
+        json.dump(split_index, file)
+
 def create_normalization(data_file, norm_out_file,camera = None):
     print(f"Normalizing {norm_out_file}...")
     stats = {}
@@ -105,12 +113,18 @@ def main():
                         help="Output path for the normalized, merged HDF5")
     args = parser.parse_args()
 
-    with open(args.split_index) as f:
-        split_index = json.load(f)
-    
     movi_h5   = h5py.File(args.movi_path,   "r")
     lifted_h5 = h5py.File(args.lifted_path, "r")
     out_file  = h5py.File(args.out_hdf5,    "w")
+
+
+    index_file = os.path.join(os.getcwd(),args.split_index)
+    if not os.path.exists(index_file):
+        create_split_index(movi_h5,index_file)
+
+    with open(args.split_index) as f:
+        split_index = json.load(f)
+    
 
     gt_norm_path = os.path.join(os.getcwd(),args.gt_norm_path)
     pg1_norm_path = os.path.join(os.getcwd(),args.pg1_norm_path)
