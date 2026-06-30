@@ -83,33 +83,6 @@ def val_norm_stats(data, split, camera, ds):
         print(f'\t sigma: {np_data.std(axis = 0).mean().mean()}')
     return n_missing
 
-
-# def rmse(a, b):
-#     return np.sqrt(np.mean((a - b) ** 2))
-
-# def val_rmse(h5):
-    
-#     for split in ["train", "val", "test"]:
-#         pg1_errs = {}
-#         pg2_errs = {}
-#         clips = [key for key in h5[split].keys() if "pg1" in h5[split][key].keys() and "pg2" in h5[split][key].keys()]
-#         for i, clip in enumerate(clips):
-#             for ds in ["poses","trans", "betas"]:
-#                 if i == 0:
-#                     other_clip = clips[-1]
-#                 else:
-#                     other_clip = clips[i-1]
-
-#                 gt = np.array(h5[split][clip])
-#                 other_gt = np.array(h5[split][other_clip])
-                
-#                 pg1 = np.array(h5[split][clip]["pg1"])
-#                 pg2 = np.array(h5[split][clip]["pg2"])
-
-#                 rmse1_true = rmse(pg1, gt)
-#                 print(rmse1_true.shape)
-#                 raise Exception()
-
                 
 
 def rmse(a, b):
