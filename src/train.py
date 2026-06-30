@@ -110,6 +110,7 @@ def train(cfg: Config) -> None:
     print(f"Actor params: {n_actor:,}  |  Critic params: {n_critic:,}")
 
     # ── Memory ───────────────────────────────────────────────────────────────
+    # number of rollouts should equal the memory size for PPO always
     memory = RandomMemory(memory_size=cfg.rollouts, num_envs=1, device=device)
 
     # ── PPO config ───────────────────────────────────────────────────────────
@@ -129,6 +130,7 @@ def train(cfg: Config) -> None:
     ppo_cfg["experiment"]["write_interval"]      = cfg.log_interval
     ppo_cfg["experiment"]["checkpoint_interval"] = cfg.checkpoint_interval
 
+    # TODO: train.py: Do we need to use PPO or PPO_RNN?
     agent = PPO(
         models={"policy": actor, "value": critic},
         memory=memory,

@@ -88,3 +88,5 @@ class MoViDataset(Dataset):
                 data["x"][key] = torch.from_numpy(clip_grp[camera][key][:].astype(np.float32)).to(self.device)
                 data["y"][key] = torch.from_numpy(clip_grp[key][:].astype(np.float32)).to(self.device)
         return data
+    
+# TODO: Anya: check length and norm stats, unnormalization - round trip, visualize before & after renders

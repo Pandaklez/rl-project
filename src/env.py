@@ -132,22 +132,23 @@ class GymMoviEnv(gymnasium.Env):
         obs = flatten_state(state).detach().cpu().numpy()
         return obs, {}
 
+    # TODO: plot the delta updates and the corrected poses to see if they are reasonable to Tensorboard
     def step(self, action: np.ndarray):
         action_dict = unflatten_action(torch.from_numpy(action).float())
         next_lifted = {k: self._x[k][self._t + 1] for k in self.keys}
-        gt_current  = {k: self._y[k][self._t].to(self.device) for k in self.keys}
+        gt_current = {k: self._y[k][self._t].to(self.device) for k in self.keys}
 
-        self._state    = self._inner.step(action_dict, next_lifted)
-        corrected_t    = {k: self._state["corrected_state"][k] for k in self.keys}
+        self._state = self._inner.step(action_dict, next_lifted)
+        corrected_t = {k: self._state["corrected_state"][k] for k in self.keys}
 
         reward = compute_reward(
             corrected_t, gt_current, self._prev_corrected,
             self.w_similarity, self.w_smoothness, self.reward_scale,
         )
 
-        self._t               += 1
-        terminated             = self._t >= self._T - 1
-        self._prev_corrected   = {k: corrected_t[k].clone() for k in self.keys}
+        self._t += 1
+        terminated = self._t >= self._T - 1
+        self._prev_corrected = {k: corrected_t[k].clone() for k in self.keys}
 
         obs = flatten_state(self._state).detach().cpu().numpy()
         return obs, reward, terminated, False, {}
