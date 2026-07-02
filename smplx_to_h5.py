@@ -173,6 +173,7 @@ def build_clip_arrays(frame_map: dict[int, Path], start: int, end: int):
             missing += 1
             continue
         d = np.load(frame_map[fi])
+        # TODO: double check that shapes split is correct
         poses = np.concatenate([
             d["global_orient"].reshape(-1, 3),   # (1,  3)
             d["body_pose"].reshape(-1, 3),        # (21, 3)
