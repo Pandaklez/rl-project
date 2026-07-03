@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+# NOTE: the PPO_DEFAULT_CONFIG is hallucinated, need to re-write training to suit latest version of skrl. 
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory

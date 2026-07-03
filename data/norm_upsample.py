@@ -97,7 +97,7 @@ def main():
         description="Normalize GT and lifted poses and write to a single HDF5 "
                     "matching the MoViDataset layout."
     )
-    parser.add_argument("--movi_path",    default="data/Gmovi.h5",
+    parser.add_argument("--movi_path",    default="data/movi_smplx.h5",
                         help="HDF5 with raw GT poses/trans/betas (from movi_raw_processing.py)")
     parser.add_argument("--lifted_path",  default="data/lifted_movi_part1_upd2.h5",
                         help="HDF5 with lifted poses from PG1/PG2 cameras")
