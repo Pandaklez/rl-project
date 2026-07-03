@@ -22,8 +22,7 @@ __pycache__/
 .vscode
 
 checkpoints/
-/data/
-data/*
+
 demo/*
 .claude/*
 .claude/

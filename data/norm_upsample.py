@@ -2,6 +2,7 @@ import numpy as np
 import h5py
 import argparse
 import json
+import os
 
 FRAMERATE = 120  # Hz — fixed for MoVi
 
@@ -56,37 +57,90 @@ def upsample(poses, trans, T):
 
     return poses_up, trans_up
 
+def create_split_index(data_file, index_out_file):
+    split_index = {}
+    for split in ["train", "val", "test"]:
+        split_index[split] = list(data_file[split].keys())
+
+    with open(index_out_file, "w") as file:
+        json.dump(split_index, file)
+
+def create_normalization(data_file, norm_out_file,camera = None):
+    print(f"Normalizing {norm_out_file}...")
+    stats = {}
+    for ds in ["poses","trans", "betas"]:
+        raw_data = []
+        for key in list(data_file["train"].keys()):
+            if camera:
+                try:
+                    ex = data_file["train"][key][camera]
+                except:
+                    continue # Just move on with loop if camera lacking for clip
+            else: 
+                ex = data_file["train"][key]
+            raw_data.append(ex[ds])
+        if ds == "betas":
+            np_data = np.stack(raw_data,axis = 0)
+        else:
+            np_data = np.concat(raw_data,axis = 0)
+        stats[ds] = {
+            "shape" : np_data.shape,
+            "mu" : np_data.mean(axis=0).tolist(),
+            "sigma" : np_data.std(axis=0).tolist()
+        }
+    with open(norm_out_file,"w") as dump_file:
+        json.dump(stats,dump_file)
+    
 
 def main():
     parser = argparse.ArgumentParser(
         description="Normalize GT and lifted poses and write to a single HDF5 "
                     "matching the MoViDataset layout."
     )
-    parser.add_argument("--movi_path",    default="Gmovi.h5",
+    parser.add_argument("--movi_path",    default="data/movi_smplx.h5",
                         help="HDF5 with raw GT poses/trans/betas (from movi_raw_processing.py)")
-    parser.add_argument("--lifted_path",  default="lifted_movi_part1_upd1.h5",
+    parser.add_argument("--lifted_path",  default="data/lifted_movi_part1_upd2.h5",
                         help="HDF5 with lifted poses from PG1/PG2 cameras")
-    parser.add_argument("--split_index",  default="split_index.json",
+    parser.add_argument("--split_index",  default="data/split_index.json",
                         help="JSON with {'train': [...], 'val': [...], 'test': [...]}")
-    parser.add_argument("--gt_norm_path", default="normalization.json",
+    parser.add_argument("--gt_norm_path", default="data/normalization.json",
                         help="Normalization stats for GT (mu/sigma per key)")
-    parser.add_argument("--pg1_norm_path", default="normalization_lifted_pg1.json",
+    parser.add_argument("--pg1_norm_path", default="data/normalization_lifted_pg1.json",
                         help="Normalization stats for PG1 lifted data")
-    parser.add_argument("--pg2_norm_path", default="normalization_lifted_pg2.json",
+    parser.add_argument("--pg2_norm_path", default="data/normalization_lifted_pg2.json",
                         help="Normalization stats for PG2 lifted data")
-    parser.add_argument("--out_hdf5",    default="processed_movi.h5",
+    parser.add_argument("--out_hdf5",    default="data/processed_movi.h5",
                         help="Output path for the normalized, merged HDF5")
     args = parser.parse_args()
-
-    with open(args.split_index) as f:
-        split_index = json.load(f)
-    gt_norm_stats  = json.load(open(args.gt_norm_path))
-    pg1_norm_stats = json.load(open(args.pg1_norm_path))
-    pg2_norm_stats = json.load(open(args.pg2_norm_path))
 
     movi_h5   = h5py.File(args.movi_path,   "r")
     lifted_h5 = h5py.File(args.lifted_path, "r")
     out_file  = h5py.File(args.out_hdf5,    "w")
+
+
+    index_file = os.path.join(os.getcwd(),args.split_index)
+    if not os.path.exists(index_file):
+        create_split_index(movi_h5,index_file)
+
+    with open(args.split_index) as f:
+        split_index = json.load(f)
+    
+
+    gt_norm_path = os.path.join(os.getcwd(),args.gt_norm_path)
+    pg1_norm_path = os.path.join(os.getcwd(),args.pg1_norm_path)
+    pg2_norm_path = os.path.join(os.getcwd(),args.pg2_norm_path)
+
+    if not os.path.exists(gt_norm_path):
+        create_normalization(movi_h5,gt_norm_path)
+    if not os.path.exists(pg1_norm_path):
+        create_normalization(lifted_h5,pg1_norm_path,"PG1")
+    if not os.path.exists(pg2_norm_path):
+        create_normalization(lifted_h5,pg2_norm_path,"PG2")
+
+    gt_norm_stats  = json.load(open(gt_norm_path))
+    pg1_norm_stats = json.load(open(pg1_norm_path))
+    pg2_norm_stats = json.load(open(pg2_norm_path))
+
 
     out_file.attrs["description"] = "MoVi — normalized GT + lifted poses per action clip"
     out_file.attrs["framerate"]   = FRAMERATE

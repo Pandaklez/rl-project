@@ -9,7 +9,7 @@ from decord import VideoReader, cpu
 import matplotlib.pyplot as plt
 
 
-from pack_movi_hdf5 import _scalar, _str, _unwrap
+from data.pack_movi_hdf5 import _scalar, _str, _unwrap
 
 # logging.basicConfig(
 #     level=logging.INFO,
@@ -36,7 +36,7 @@ def get_action_meta(meta_path):
     subj    = _unwrap(mat[top_key])   # mat_struct with fields: id, subject, move
     move_arr = _unwrap(subj.move)
 
-    action_names = [str(_unwrap(action[0])).lstrip("['").rstrip("']") for action in move_arr.motions_list]
+    action_names = [str(_unwrap(action[0])).lstrip("['").rstrip("']").replace("/","_").replace(" ","_") for action in move_arr.motions_list]
     action_inds = np.array([[int(tup[0]),int(tup[1])] for tup in move_arr.flags30])
 
     return action_names, action_inds
@@ -88,4 +88,3 @@ if __name__ == '__main__':
 
     for video_path in video_paths:
         check_move_times(video_path, action_names, action_inds)
-
