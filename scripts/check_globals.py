@@ -76,19 +76,39 @@ class DataManager:
                 raise ValueError(f"Key '{key}' not found in data_dict for unscaling")
         return unscaled
     
-    def check_param(self, camera, joint = 0):
+    def check_param(self, camera,n_clips = None, joint = 0, comparison = "R_ext*Rt", permutation = None):
+        """
+        Some terminology I'm using here:
+    
+        Rc = describes orientation as seen in 'camera space'
+        Rt = describes orientation as seen in gt space
+        Rext = Rotation matrix provided from data/calib/Extrinsics_PGX.npz
+
+        From the MoVi paper I understand it as Rext is for moving from the global space to the camera space
+        hence 
+        Rc_hat = R_ext*Rt should be like 'take this global orientation into camera space' i.e. should be close to Rc.
+
+        The goal should be to figure out what might be the difference between gt and lifted, and then apply the inverse
+        in our processing script, i.e.(R_ideal^-1)clip['pg1']['poses'][:,0,:], but then we need to understand what this true 
+        rotation and its inverse is. 
+        NOTE: there could be another issue on top of this, i.e. if the coordinate systems are simply defined differently between 
+        gt and cameras (e.g., right, front, up or front, left, up). In this case, maybe we should try permuting x and y? in combination 
+        with using the camera extrinsics? like take [-y, x, z] or [y, -x, z]? 
+        NOTE: this is now projecting gt into camera, but when we know what seems like the proper combo of permutation and rotation, 
+        we need to incorporate the INVERSE of that into the processing script. 
+        """
         
         offsets = []
 
         data = self._get_file()[self.split]
         R_ext = R.from_matrix(self.cam_params[camera]['rotationMatrix'])
-        trans_ext = self.cam_params[camera]['translationVector']
-
-        # NOTE: For now just hard-coding one clip
-        for clip_name in data.keys():
-        # clip_name = list(data.keys())[0]
+        trans_ext = self.cam_params[camera]['translationVector'] # NOTE: Currently not checked, but could be used with the translation data. 
+        clip_names = list(data.keys())
+        if n_clips:
+            clip_names = clip_names[:n_clips]
+        for clip_name in clip_names:
             clip = data[clip_name]
-            # gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]}
+            # gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]} # NOTE: commented out as added gt as a key. 
             gt_clip = clip["gt"]
             camera_clip = clip.get(camera)
             if camera_clip:
@@ -98,13 +118,27 @@ class DataManager:
                 camera_joint = camera_scaled["poses"][:, joint, :].reshape(-1,3) # (T, 1, 3) -> (T, 3)
                 gt_joint = gt_scaled["poses"][:, joint, :].reshape(-1,3) # (T, 1, 3) -> (T, 3)
 
+                if permutation == "y,-x,z":
+                    gt_joint_copy = gt_joint
+                    gt_joint[:,0] = gt_joint_copy[:,1]
+                    gt_joint[:,1] = -1*gt_joint_copy[:,0]
+                elif permutation == "-y,x,z":
+                    gt_joint_copy = gt_joint
+                    gt_joint[:,0] = -1*gt_joint_copy[:,1]
+                    gt_joint[:,1] = gt_joint_copy[:,0]
+                    
+
                 T = camera_joint.shape[0]
                 for i in range(T):
                     
                     Rc = R.from_rotvec(camera_joint[i])
                     Rt = R.from_rotvec(gt_joint[i])
-                    
-                    Rc_hat = R_ext*Rt
+                    if comparison == "R_ext*Rt":
+                        Rc_hat = R_ext*Rt
+                    elif comparison == "Rt":
+                        Rc_hat = Rt
+                    elif comparison == "R_ext.inv()*Rt":
+                        Rc_hat = R_ext.inv()*Rt
 
                     R_err = Rc * Rc_hat.inv()
 
@@ -123,6 +157,10 @@ class DataManager:
 
     
     def get_joint_comp(self, camera, joint = 0): # Root orientation by default
+        """
+        NOTE: initially written func for checking orientations, before camera extrinsics were incorporated
+        pretty much not in use. 
+        """
 
         offsets = []
 
@@ -176,18 +214,24 @@ def main():
     dm = DataManager(args.processed_data_path, args.gt_norm_path, args.pg1_norm_path, args.pg2_norm_path, args.camera_param_path, split = "train")
     
     for camera in ("pg1","pg2"):
-        for joint in [0]:
-            print(f"{camera}, {joint}")
-            # mu, sigma = dm.get_joint_comp(camera, joint)
-            mu, sigma = dm.check_param(camera, joint)
+        joint = 0
+        for comparison in ["R_ext*Rt","Rt","R_ext.inv()*Rt"]:
+            for permutation in [None,"y,-x,z","-y,x,z"]:
 
-            print(mu) # Around 2.9
-            print(sigma) # Around 0.2
+                print(f"{camera}, {joint}, Rc against {comparison}, permutation: {permutation}")
+                # mu, sigma = dm.get_joint_comp(camera, joint)
+                # mu, sigma = dm.check_param(camera, joint, comparison)
+                mu, sigma = dm.check_param(camera=camera,n_clips = 10, joint = 0, comparison = comparison, permutation=permutation)
 
-            print()
-            print()
+                print("mu")
+                print(mu) # Around 2.9
+                print("sigma")
+                print(sigma) # Around 0.2
 
-    
+                print()
+                print()
+
+        
 
 
 
