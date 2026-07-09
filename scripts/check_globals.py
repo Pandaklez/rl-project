@@ -88,7 +88,8 @@ class DataManager:
         for clip_name in data.keys():
         # clip_name = list(data.keys())[0]
             clip = data[clip_name]
-            gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]}
+            # gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]}
+            gt_clip = clip["gt"]
             camera_clip = clip.get(camera)
             if camera_clip:
                 camera_scaled = self.unnormalize(camera_clip, camera)
@@ -129,7 +130,8 @@ class DataManager:
 
         for clip_name in data.keys():
             clip = data[clip_name]
-            gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]}
+            # gt_clip = {key: clip[key] for key in ["poses","trans", "betas"]}
+            gt_clip = clip["gt"]
             camera_clip = clip.get(camera)
 
             if camera_clip:

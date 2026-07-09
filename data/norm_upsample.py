@@ -197,8 +197,9 @@ def main():
                 continue
 
             g = grp_out.create_group(clip_name)
+            gt_grp = g.create_group("gt")
             for key in ("poses", "trans", "betas"):
-                g.create_dataset(key, data=gt_norm[key], compression="gzip", compression_opts=4, chunks=True)
+                gt_grp.create_dataset(key, data=gt_norm[key], compression="gzip", compression_opts=4, chunks=True)
             for cam_out, cam_data in lifted_norm.items():
                 cam_grp = g.create_group(cam_out)
                 for key in ("poses", "trans", "betas"):

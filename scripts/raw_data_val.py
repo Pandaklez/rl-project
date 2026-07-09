@@ -57,15 +57,21 @@ def val_norm_stats(data, split, camera, ds):
     n_missing = 0
     raw_data = []
     for clip in data[split].keys():
-        if camera: 
-            try:
-                row = data[split][clip][camera]
-            except:
-                # print(f"Could not read split {split}, clip {clip}, camera {camera}")
-                n_missing += 1
-                continue
-        else:
-            row = data[split][clip]
+        try:
+            row = data[split][clip][camera]
+        except:
+            # print(f"Could not read split {split}, clip {clip}, camera {camera}")
+            n_missing += 1
+            continue
+        # if camera: 
+        #     try:
+        #         row = data[split][clip][camera]
+        #     except:
+        #         # print(f"Could not read split {split}, clip {clip}, camera {camera}")
+        #         n_missing += 1
+        #         continue
+        # else:
+        #     row = data[split][clip]
         raw_data.append(row[ds])
 
     if ds == "betas":
@@ -111,8 +117,8 @@ def val_rmse(h5):
             for i, clip in enumerate(clips):
                 other_clip = clips[i - 1]  
 
-                gt = np.asarray(h5[split][clip][ds])
-                gt_other = np.asarray(h5[split][other_clip][ds])
+                gt = np.asarray(h5[split][clip]["gt"][ds])
+                gt_other = np.asarray(h5[split][other_clip]["gt"][ds])
 
                 pred_pg1 = np.asarray(h5[split][clip]["pg1"][ds])
                 pred_pg2 = np.asarray(h5[split][clip]["pg2"][ds])
@@ -169,7 +175,7 @@ def main():
     tot_missing = 0
     
     for split in ["train","val", "test"]:
-        for camera in (None,"pg1","pg2"):
+        for camera in ("gt","pg1","pg2"):
             for ds in ["poses","trans","betas"]:
                 tot_missing += val_norm_stats(data, split, camera, ds)
 
