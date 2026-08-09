@@ -66,6 +66,29 @@ def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
     }
 
 
+# Initial log standard deviation of the action distribution.
+#
+# Actions are correction *deltas* in normalised pose units, so std = 1.0 (the
+# old `zeros` init) perturbs every joint by a full standard deviation of the
+# pose distribution on every frame. Against the reprojection reward that lands
+# in the saturated corner of exp(-e²/σ²), where there is almost no gradient and
+# the first thing the policy has to learn is to undo its own initialisation.
+#
+# Measured on the train split (reward σ = 0.04):
+#
+#     action std   err_px   r_reproj   r_smooth   combined
+#       0.00        15.5     0.584      0.936      0.678     <- identity
+#       0.05        15.7     0.578      0.927      0.671
+#       0.20        18.2     0.479      0.799      0.559
+#       1.00        49.8     0.034      0.016      0.036     <- old default
+#
+# log(0.05) ~= -3.0 starts the policy as a small perturbation around the lifted
+# pose, in the responsive part of the reward, which is what a residual policy
+# wants. PPO learns log_std from there, so this is a starting point and not a
+# ceiling.
+INIT_LOG_STD = -3.0
+
+
 # ─── Legacy models (used by src/evaluate.py) ──────────────────────────────────
 
 class PoseActor(nn.Module):
@@ -81,11 +104,12 @@ class PoseActor(nn.Module):
         use_betas:   bool          = False,
         hidden_dims: tuple[int, ...] = (512, 256),
         dropout:     float         = 0.0,
+        init_log_std: float        = INIT_LOG_STD,
     ):
         super().__init__()
         state_dim    = STATE_DIM + (BETAS_DIM if use_betas else 0)
         self.net     = _mlp([state_dim, *hidden_dims, FRAME_DIM], dropout=dropout)
-        self.log_std = nn.Parameter(torch.zeros(FRAME_DIM))
+        self.log_std = nn.Parameter(torch.full((FRAME_DIM,), float(init_log_std)))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -158,6 +182,7 @@ class SkrlPoseActor(GaussianMixin, Model):
         device,
         hidden_dims: tuple[int, ...] = (512, 256),
         dropout:     float           = 0.0,
+        init_log_std: float          = INIT_LOG_STD,
     ):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(
@@ -169,7 +194,7 @@ class SkrlPoseActor(GaussianMixin, Model):
             reduction="sum",
         )
         self.net     = _mlp([self.num_observations, *hidden_dims, self.num_actions], dropout=dropout)
-        self.log_std = nn.Parameter(torch.zeros(self.num_actions))
+        self.log_std = nn.Parameter(torch.full((self.num_actions,), float(init_log_std)))
         self._init_weights()
 
     def _init_weights(self) -> None:

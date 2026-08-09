@@ -686,12 +686,23 @@ python -m src.train --h5_path data/processed_movi.h5 --viz_interval 3 --viz_clip
 
 - **Betas score 2.7%**, worse than chance, i.e. a lifted shape estimate is usually closer to
   some other clip's GT than to its own. Independent of the camera issue and unexamined.
-- **`movi_smplx_processing.py` is committed twice**, byte-identical in `data/` and `scripts/`.
-  Your note explains why; `scripts/` is canonical, so the `data/` copy should go.
+- **`movi_smplx_processing.py` is committed twice, and the copies are no longer identical.**
+  They were byte-identical when both landed in `3a3c723`, but the `from __future__ import
+  annotations` fix from §1 was applied to `scripts/` only (in `97cf7ab`). The `data/` copy
+  never got it, so it now **crashes on the `smplerx` env** — `TypeError: 'type' object is
+  not subscriptable`, the `list[int]` annotation evaluated at def-time — while `scripts/`
+  imports cleanly. Verified on Python 3.8.20 and 3.12.4. That makes the `data/` copy not
+  merely redundant but the broken one, and it is the copy sitting next to the data a
+  newcomer would reach for. `scripts/` is canonical; the `data/` copy should go (it is
+  git-tracked, so removal is recoverable).
 - **`smplx_to_h5.py:303`** sets `trans_units = "metres"`, wrong for the lifted groups (§2).
+  Worth revisiting in light of §5: the units are now *recoverable* — `src/reproject.py`
+  converts them — so the attribute could be corrected rather than merely flagged.
 - **Re-rendering validation** still to do, now that there is a metric worth validating against.
-- **`README.md`** is currently the vendored body_visualizer README, overwritten by mistake;
-  the committed version at `git show HEAD:README.md` is still the rl-project one.
+- ~~**`README.md`** is the vendored body_visualizer README, overwritten by mistake~~ —
+  **fixed.** The vendored copy was moved to `body_visualizer/README.md` (it shipped no
+  README of its own, which is how it ended up at the root) and the project README restored
+  and brought up to date. Nothing was deleted.
 
 ## Reproducing
 
