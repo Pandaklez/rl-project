@@ -79,6 +79,15 @@ class GymMoviEnv(gymnasium.Env):
     On each reset() a clip is sampled at random from the dataset.
     The agent sees a flat STATE_DIM observation and outputs a flat FRAME_DIM action
     (correction delta).  Episodes end when the clip runs out of frames.
+
+    Two reward modes:
+
+    * `reward_mode="gt"` (default) — the original GT-based similarity term. This
+      is a supervised objective, so it is **not** a valid reward for experiments
+      (B) or (C); keep it for ablations and debugging.
+    * `reward_mode="reproj"` — reprojection + smoothness, using no ground truth
+      (`src/rewards.py`). This is the reward experiment (B) calls for. It needs
+      the dataset to have been built with `reproj_path=`.
     """
 
     metadata = {"render_modes": []}
@@ -91,6 +100,10 @@ class GymMoviEnv(gymnasium.Env):
         w_similarity: float = 1.0,
         w_smoothness: float = 0.1,
         reward_scale: float = 10.0,
+        reward_mode:  str   = "gt",
+        reproj_reward=None,
+        w_reproj:     float = 1.0,
+        baseline_every: int = 10,
     ):
         super().__init__()
         self.dataset      = dataset
@@ -99,6 +112,20 @@ class GymMoviEnv(gymnasium.Env):
         self.w_similarity = w_similarity
         self.w_smoothness = w_smoothness
         self.reward_scale = reward_scale
+        self.reward_mode  = reward_mode
+        self.w_reproj     = w_reproj
+        # Scoring the *unmodified* lifted frame alongside the corrected one is the
+        # only way to see whether the policy is actually improving the fit rather
+        # than just collecting a high reward the lifted pose already earned. It
+        # costs a second forward pass, so it runs on every Nth frame (0 = off).
+        self.baseline_every = int(baseline_every)
+
+        if reward_mode not in ("gt", "reproj"):
+            raise ValueError(f"reward_mode must be 'gt' or 'reproj', got {reward_mode!r}")
+        if reward_mode == "reproj" and reproj_reward is None:
+            raise ValueError("reward_mode='reproj' requires a ReprojectionReward instance")
+        self._reproj = reproj_reward
+        self._reproj_active = False
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32,
@@ -127,7 +154,12 @@ class GymMoviEnv(gymnasium.Env):
 
         state = self._inner.reset({k: self._x[k][0] for k in self.keys})
         self._prev_corrected = {k: state["corrected_state"][k].clone() for k in self.keys}
+        # Acceleration needs two frames of history, not one.
+        self._prev2_corrected = {k: v.clone() for k, v in self._prev_corrected.items()}
         self._state          = state
+
+        if self.reward_mode == "reproj":
+            self._reproj_active = self._reproj.reset(sample)
 
         obs = flatten_state(state).detach().cpu().numpy()
         return obs, {}
@@ -136,19 +168,54 @@ class GymMoviEnv(gymnasium.Env):
     def step(self, action: np.ndarray):
         action_dict = unflatten_action(torch.from_numpy(action).float())
         next_lifted = {k: self._x[k][self._t + 1] for k in self.keys}
-        gt_current = {k: self._y[k][self._t].to(self.device) for k in self.keys}
 
         self._state = self._inner.step(action_dict, next_lifted)
         corrected_t = {k: self._state["corrected_state"][k] for k in self.keys}
 
-        reward = compute_reward(
-            corrected_t, gt_current, self._prev_corrected,
-            self.w_similarity, self.w_smoothness, self.reward_scale,
-        )
+        if self.reward_mode == "reproj":
+            # GT is deliberately not read on this path.
+            reward, info = self._reproj_step(corrected_t)
+        else:
+            gt_current = {k: self._y[k][self._t].to(self.device) for k in self.keys}
+            reward = compute_reward(
+                corrected_t, gt_current, self._prev_corrected,
+                self.w_similarity, self.w_smoothness, self.reward_scale,
+            )
+            info = {}
 
         self._t += 1
         terminated = self._t >= self._T - 1
+        self._prev2_corrected = self._prev_corrected
         self._prev_corrected = {k: corrected_t[k].clone() for k in self.keys}
 
         obs = flatten_state(self._state).detach().cpu().numpy()
-        return obs, reward, terminated, False, {}
+        return obs, reward, terminated, False, info
+
+    def _reproj_step(self, corrected_t: dict) -> tuple[float, dict]:
+        """Reprojection + smoothness, no ground truth involved."""
+        from src.rewards import combine, smoothness_reward
+
+        smooth = smoothness_reward(
+            corrected_t["poses"].detach().cpu().numpy(),
+            self._prev_corrected["poses"].detach().cpu().numpy(),
+            self._prev2_corrected["poses"].detach().cpu().numpy(),
+        )
+        if self._reproj_active:
+            r_proj, info = self._reproj.step(corrected_t, self._t)
+        else:
+            r_proj, info = float("nan"), {"valid": False}
+
+        info["r_smooth"] = smooth
+        info["r_reproj"] = r_proj
+
+        if (self.baseline_every and self._reproj_active
+                and self._t % self.baseline_every == 0):
+            # self._x is the raw clip, so index _t is still the current frame even
+            # though the inner env has already advanced its lifted_state to _t+1.
+            lifted_t = {k: self._x[k][self._t] for k in self.keys}
+            r_base, base = self._reproj.step(lifted_t, self._t)
+            if base["valid"]:
+                info["r_reproj_lifted"] = r_base
+                info["err_px_lifted"] = base["err_px"]
+
+        return combine(r_proj, smooth, self.w_reproj, self.w_smoothness), info

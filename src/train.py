@@ -27,11 +27,17 @@ from src.viz_pose import PoseVizLogger
 
 class PPOWithPoseViz(PPO):
     """
-    PPO plus a periodic 2D skeleton overlay in TensorBoard.
+    PPO plus a periodic 2D skeleton overlay in TensorBoard, and per-step logging
+    of the reward components.
 
     The figure is expensive relative to a scalar (it rolls the policy out over a
     few validation clips and runs SMPL-X forward), so it is logged every
     `viz_interval` updates rather than every step.
+
+    The reward components come through the env's `info` dict, which skrl's
+    gymnasium wrapper passes along untouched. They go through `track_data`, so
+    skrl averages them and writes at the configured `write_interval` rather than
+    once per step.
     """
 
     def __init__(self, *args, viz_logger=None, viz_interval: int = 3, **kwargs):
@@ -39,6 +45,46 @@ class PPOWithPoseViz(PPO):
         self._viz_logger = viz_logger
         self._viz_interval = viz_interval
         self._update_count = 0
+
+    def record_transition(self, states, actions, rewards, next_states,
+                          terminated, truncated, infos, timestep, timesteps) -> None:
+        super().record_transition(states, actions, rewards, next_states,
+                                  terminated, truncated, infos, timestep, timesteps)
+        if isinstance(infos, dict) and infos:
+            self._track_reward_components(infos)
+
+    def _track_reward_components(self, info: dict) -> None:
+        """
+        Break the scalar reward into the parts that explain it.
+
+        `r_reproj` and `err_px` are nan on frames with no 2D evidence — those are
+        skipped rather than tracked, since a single nan would poison the mean and
+        the curve would silently vanish from TensorBoard.
+        """
+        def ok(x):
+            return isinstance(x, (int, float)) and x == x        # not nan
+
+        if ok(info.get("r_reproj")):
+            self.track_data("Reward / reprojection", float(info["r_reproj"]))
+        if ok(info.get("r_smooth")):
+            self.track_data("Reward / smoothness", float(info["r_smooth"]))
+        if ok(info.get("err_px")):
+            self.track_data("Reprojection / error corrected (px)", float(info["err_px"]))
+            self.track_data("Reprojection / joints scored", float(info.get("n_joints", 0)))
+
+        # The comparison that matters: is the policy beating the lifted input, or
+        # just banking the reward the lifted pose already earned? (§6 — the 2D
+        # evidence barely separates the lifted pose from GT, so a rising reward
+        # curve on its own proves very little.)
+        if ok(info.get("err_px_lifted")):
+            self.track_data("Reprojection / error lifted (px)", float(info["err_px_lifted"]))
+            if ok(info.get("err_px")):
+                self.track_data("Reprojection / improvement over lifted (px)",
+                                float(info["err_px_lifted"]) - float(info["err_px"]))
+
+        if "valid" in info:
+            self.track_data("Reprojection / frames with 2D evidence",
+                            1.0 if info["valid"] else 0.0)
 
     def post_interaction(self, timestep: int, timesteps: int) -> None:
         # Mirror PPO's own trigger so we know an update is about to happen.
@@ -87,6 +133,15 @@ class Config:
     w_smoothness: float = 0.1
     reward_scale: float = 10.0
 
+    # Reward mode. "gt" is the original supervised similarity term — valid for
+    # ablations, not for experiments (B)/(C). "reproj" is the GT-free
+    # reprojection + smoothness reward and requires --reproj_path.
+    reward_mode:  str   = "gt"
+    reproj_path:  str   = "data/reproj_targets.h5"
+    w_reproj:     float = 1.0
+    reproj_sigma: float = 0.04
+    baseline_every: int = 10    # score the raw lifted frame every N steps (0 = off)
+
     # Policy architecture
     hidden_dims: tuple = (512, 256)
     dropout:     float = 0.1
@@ -119,8 +174,20 @@ def train(cfg: Config) -> None:
     print(f"Device: {device}")
 
     # ── Dataset & env ────────────────────────────────────────────────────────
-    dataset = MoViDataset(cfg.h5_path, cfg.norm_stats_path, split="train", verbose=False)
+    use_reproj = cfg.reward_mode == "reproj"
+    dataset = MoViDataset(cfg.h5_path, cfg.norm_stats_path, split="train", verbose=False,
+                          reproj_path=cfg.reproj_path if use_reproj else None)
     print(f"Train samples: {len(dataset)}")
+
+    reproj_reward = None
+    if use_reproj:
+        from src.rewards import ReprojectionReward, load_calib
+        reproj_reward = ReprojectionReward(
+            load_calib(cfg.h5_path), sigma=cfg.reproj_sigma,
+        )
+        print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT")
+    else:
+        print("Reward: GT similarity + smoothness (supervised; ablation only)")
 
     gym_env = GymMoviEnv(
         dataset,
@@ -128,6 +195,10 @@ def train(cfg: Config) -> None:
         w_similarity=cfg.w_similarity,
         w_smoothness=cfg.w_smoothness,
         reward_scale=cfg.reward_scale,
+        reward_mode=cfg.reward_mode,
+        reproj_reward=reproj_reward,
+        w_reproj=cfg.w_reproj,
+        baseline_every=cfg.baseline_every,
     )
     gym_env.reset(seed=cfg.seed)
     env = wrap_env(gym_env)
@@ -234,6 +305,13 @@ def main() -> None:
     parser.add_argument("--w_similarity",        type=float, default=1.0)
     parser.add_argument("--w_smoothness",        type=float, default=0.1)
     parser.add_argument("--reward_scale",        type=float, default=10.0)
+    parser.add_argument("--reward_mode",         choices=("gt", "reproj"), default="gt",
+                        help="'reproj' is the GT-free reward for experiments (B)/(C)")
+    parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
+    parser.add_argument("--w_reproj",            type=float, default=1.0)
+    parser.add_argument("--reproj_sigma",        type=float, default=0.04)
+    parser.add_argument("--baseline_every",      type=int,   default=10,
+                        help="score the raw lifted frame every N steps for comparison (0 disables)")
     parser.add_argument("--dropout",             type=float, default=0.1)
     parser.add_argument("--total_updates",       type=int,   default=3000)
     parser.add_argument("--out_dir",             default="checkpoints")

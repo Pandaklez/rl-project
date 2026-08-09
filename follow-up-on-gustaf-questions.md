@@ -12,10 +12,14 @@ the answer, and which script produces it.
 | `src/smplx_fk.py` | SMPL-X forward kinematics: axis-angle pose params -> 3D joint positions |
 | `src/viz_pose.py` | TensorBoard 2D skeleton overlays (lifted / corrected / GT) on held-out clips |
 | `scripts/extract_2d.py` | Re-derives per-frame bbox + ViTPose 2D keypoints, unblocking the reprojection reward |
+| `src/reproject.py` | Virtual-camera `transl` -> metres in the real camera, plus projection |
+| `scripts/build_reproj_targets.py` | Builds `data/reproj_targets.h5`, the reprojection targets |
+| `src/rewards.py` | **The GT-free reward.** Reprojection + smoothness for experiments (B)/(C) |
+| `tests/test_reproject.py`, `tests/test_rewards.py` | 41 tests pinning the conversion, the resampling rule and the reward |
 | `scripts/migrate_gt_layout.py` | One-off in-place migration of an old flat `processed_movi.h5` to the `gt/` subgroup layout |
 
-**Files changed**: `src/evaluate.py`, `src/data/datasets.py`, `scripts/raw_data_val.py`,
-`scripts/movi_smplx_processing.py`.
+**Files changed**: `src/evaluate.py`, `src/data/datasets.py`, `src/env.py`, `src/train.py`,
+`src/camera_frame.py`, `scripts/raw_data_val.py`, `scripts/movi_smplx_processing.py`.
 
 ---
 
@@ -369,13 +373,95 @@ the bbox, **100%** correct anatomical vertical ordering, and the rendered skelet
 on the subject. Worth stressing — the checkpoint loaded without error while two real bugs
 were still present, so "it loads" proved nothing.
 
-Once it has run, metric translation follows with no GT:
+### Done — `data/keypoints2d.h5`
+
+The full run has completed: **all 175 videos** (87 PG1 + 88 PG2), 803,324 frames, 94 MB.
+
+| | |
+|---|---|
+| Detection rate *within clip ranges* | **99.95%** mean, 98.1% worst clip |
+| Mean keypoint confidence | 0.889 |
+| Malformed or truncated groups | none |
+
+One number needs reading carefully: detection across *all* frames is 78%, which is not a
+failure rate — it is the `flags30` skip working, since the wanted-frame fraction is 0.783
+and frames outside clip ranges are deliberately left zero-filled.
+
+Coverage against the dataset is complete. The 1779 clips span 85 subjects; all have PG2 2D
+and all have PG1 2D except `Subject_6`, which has no PG1 video at all and correspondingly
+carries only a `pg2` group. The three subjects with 2D but no clips (10, 26, 49) are among
+the 22 skipped for lacking both angles.
+
+### Metric translation — `src/reproject.py`
+
+Recovered with no GT, as anticipated:
 
 ```
 f_crop = 5000/192 · bbox_w                 (inference.py:159)
 Z_real = tz · f_real / f_crop              f_real from IntrinsicMatrix
 X, Y   = (u_img − c) · Z_real / f
 ```
+
+`process_bbox` fixes the aspect at 384/512, so `5000/192·bbox_w` and `5000/256·bbox_h` are
+equal; `crop_intrinsics` asserts this rather than assuming it. Recovered depth over the test
+split is **median 4.5 m, range 2.5–6.1 m** — a mocap lab, not a 42 m virtual one.
+
+**Two traps worth knowing about**, both found by measurement rather than reading:
+
+1. **`cam_trans` positions the model origin, not the pelvis.** SMPLer-X composes its mesh as
+   `vertices + cam_trans`, and the SMPL-X pelvis sits ~0.35 m below that origin. The
+   natural-looking `J − J[:,0] + trans` therefore shifts the whole body by 0.35 m, which at
+   4.5 m depth is ~76 px — bigger than the error being measured. `place_in_camera()` exists
+   to make this hard to get wrong.
+
+   | placement | PG1 | PG2 |
+   |---|---|---|
+   | raw + `cam_trans` (correct) | **11.6 px** | **14.5 px** |
+   | pelvis at `cam_trans` | 83.4 px | 95.4 px |
+
+2. **Stay in the camera frame; the PG2 extrinsics are not good enough.** Projecting GT
+   through the calibration lands 9.7 px off for PG1 but **65–75 px for PG2 under every
+   rotation/translation convention tried** — so this is PG2 calibration accuracy, not a
+   convention error. It does not matter, because the whole reward path (lifted camera-frame
+   pose → FK → `place_in_camera` → `project`) needs only the intrinsics and the bbox. Both
+   cameras validate at 11.6 / 14.5 px that way, with no GT and no extrinsics involved.
+
+The 11.6 / 14.5 px figures are the honest end-to-end check: lifted poses projected against
+the ViTPose detections on the test split, on an 800×600 image.
+
+### Reprojection targets — `scripts/build_reproj_targets.py`
+
+Writes `data/reproj_targets.h5` (143 MB), a **sidecar** rather than more groups inside
+`processed_movi.h5`, so that rebuilding the processed file does not destroy it.
+
+```
+data/reproj_targets.h5
+└── <split>/<clip>/<cam>/
+    ├── trans_metric (t0, 3)     metres, real camera frame
+    ├── kp2d         (t0, 17, 3) ViTPose COCO-17, image px + confidence
+    ├── bbox         (t0, 4)     xywh after process_bbox
+    ├── valid        (t0,)       per-frame usability
+    └── attrs: start, end, t0, n_frames_gt, aligned, detected
+```
+
+**Frame alignment is the delicate part, and 20 cam-clips are not recoverable.**
+`add_pg{1,2}_to_h5.py:82-103` builds a lifted clip by walking the `flags30` range and
+*silently skipping* frames the detector missed, without recording which. So
+`lifted index j → video frame start + j` is exact only when nothing was dropped, i.e.
+`t0 == end − start`. That holds for **3512 of 3532 cam-clips (99.4%)**. The other 20 —
+mostly `crawling` and `cross_legged_sitting`, where the detector struggles — are written
+with `aligned = False` and no targets.
+
+Reconstructing the dropped frames from the re-run detector was tried and **rejected**: it
+disagrees with the original on 21 cam-clips (it even misses 17 frames on a clip where
+nothing was originally dropped), so it is not a reliable witness to what SMPLer-X kept.
+Guessing there would silently misalign the reward on exactly the hardest clips.
+
+Targets are stored at the **native 30 Hz** length `t0`, not the 120 Hz GT length —
+upsampling 17 keypoints fourfold would quadruple the file for no information.
+
+Coverage: 591,013 target frames, per-clip valid fraction **1.000 median, 0.932 worst**,
+no clip below 0.9.
 
 ### Optimisation: mostly a dead end, and here is the evidence
 
@@ -397,6 +483,162 @@ The three rejected ideas all trade bbox fidelity for speed, and bbox fidelity is
 what makes the recovered translation consistent with the existing lifted poses. **The job
 cannot be made dramatically faster without invalidating its own output.**
 
+### Folded into the loader
+
+`MoViDataset(..., reproj_path="data/reproj_targets.h5")` adds a `reproj` key to each
+sample, resampled onto the same T-frame timeline as the poses:
+
+```python
+sample["reproj"]["kp2d"]          # (T, 17, 3)
+sample["reproj"]["trans_metric"]  # (T, 3)
+sample["reproj"]["bbox"]          # (T, 4)
+sample["reproj"]["valid"]         # (T,) bool
+```
+
+Resampling reuses the exact mapping `norm_upsample.py:47-52` applied to the poses
+(`t_src = linspace(0, T-1, t0)`), so a target frame lines up with the pose it scores rather
+than sitting a few frames away. Validity is resampled as a 0/1 mask and thresholded at
+`>= 1.0`, so a frame interpolated between a valid and an invalid source frame does *not*
+inherit validity. Clips with no usable targets — the 20 unaligned ones — still return the
+key, zero-filled with `valid` all-False, so batching never special-cases them. Omitting
+`reproj_path` leaves the loader's behaviour exactly as before.
+
+`src/reproject.py` also carries `COCO17_TO_SMPLX`, the 12 COCO joints with an unambiguous
+SMPL-X counterpart. The five face keypoints (nose, eyes, ears) are deliberately excluded:
+the 52-joint skeleton has only `head` in that region, and pairing it with the nose would
+bake in a systematic offset.
+
+`tests/test_reproject.py` (21 tests) pins the conversion. The central one is that it is
+projection-preserving — the recovered metric point must land on the same pixel under the
+real camera as `transl` did under the virtual one — plus regression guards for the pelvis
+re-centring trap and the validity-mask rule.
+
+## 6. The reprojection reward — `src/rewards.py`
+
+Written, wired in, and measured. `--reward_mode reproj` on `src/train.py` switches from the
+old GT similarity term to reprojection + smoothness. **The GT branch is not read at all on
+that path**; `reward_mode="gt"` is kept for ablations, but it is a supervised objective and
+is not a valid reward for (B) or (C).
+
+Per frame:
+
+```
+corrected pose (normalised, world-frame root, from the policy)
+  -> unnormalise with the LIFTED per-camera stats
+  -> uncorrect_root: world -> camera frame              src/camera_frame.py
+  -> SMPL-X forward kinematics                          src/smplx_fk.py
+  -> place_in_camera at the metric translation          src/reproject.py
+  -> project with real intrinsics + radial distortion
+  -> weighted distance to the ViTPose keypoints
+```
+
+`r = exp(-err²/σ²)`, bounded to (0, 1]. Errors are divided by bbox height, so a clip filmed
+close up is not scored more harshly than one across the room — verified exact: doubling the
+subject doubles the pixel error and leaves the normalised error unchanged.
+
+Design points worth keeping:
+
+- **σ = 0.04 is a conditioning choice, not a taste one.** `exp(-e²/σ²)` is monotone, so σ
+  does *not* change which of two poses scores higher — frame ordering was identical at every
+  σ from 0.01 to 0.08. It only moves where the reward is steep. `d/de` peaks at `e = σ/√2`,
+  and the measured operating point is `e ≈ 0.028`, giving σ ≈ 0.04.
+- **Acceleration, not velocity, for smoothness.** A velocity penalty is minimised by a
+  subject who stops moving, which is wrong for a dataset of people walking and crawling.
+- **Frames with no 2D evidence return `nan`, not 0.** Scoring them zero would teach the
+  policy that poorly-detected clips are intrinsically bad — a property of the detector, not
+  of the pose. `combine()` falls back instead.
+- **Lifted betas, not GT betas** — GT shape would leak and is unavailable at inference.
+- **Degenerate depth scores 0, not `nan`.** `t_z` is a sigmoid output in `(0, 56.38)`; a
+  policy pushing it outside that has produced a meaningless pose, which is a real miss.
+
+Cost is **3.9 ms/step (255 steps/s)**, dominated by the batch-1 SMPL-X forward pass
+(~2 ms). A 3200-step rollout therefore spends ~13 s in the reward.
+
+`tests/test_rewards.py` covers it (32 pass in the default env; the 9 FK-dependent ones need
+the `smplerx` env, where they also pass). One guard is worth calling out: **the stale
+`normalization_lifted_pg{1,2}.json` at the repo root** predate the root correction and lack
+the `_root_corrected` flag. Unnormalising with them puts the pose **138 px** off instead of
+13. `load_lifted_stats` now reads from `data/` and raises on the flag rather than failing
+silently — this cost me a debugging cycle and would cost anyone else one too.
+
+### The reward works. The signal in it is weak, and that is a real result.
+
+Measured on the test split, lifted baseline vs the reward:
+
+```
+lifted pose        reward 0.704    13.2 px
+lifted + noise     reward 0.343    26.8 px     penalised on 98.5% of frames
+GT pose            reward 0.711    14.0 px
+```
+
+Noise is penalised sharply, so the reward is correctly oriented and the implementation is
+sound. But **GT scores essentially the same as the lifted pose** — 0.0275 vs 0.0281 of bbox
+height. Interpolating lifted → GT moves the reward by only ~1.8% end to end.
+
+That is not a bug, it is monocular depth ambiguity. SMPLer-X was *trained* to fit the 2D
+evidence, so it already fits it about as well as GT does; its residual error lives in depth,
+which reprojection is blind to. §4 made the same point from the other direction — Procrustes
+alignment hides a 95° root error.
+
+Two consequences for the experiments:
+
+- **(B) reprojection + smoothness has little headroom on its own.** Expect it to stabilise
+  and smooth the lifted output rather than substantially improve 3D accuracy. Worth running,
+  but the hypothesis to state up front is modest.
+- **This strengthens the case for (C).** The GAIL/AMP discriminator supplies exactly the
+  prior that 2D evidence cannot: which 3D poses are plausible at all. The reprojection term
+  keeps the policy anchored to the image; the discriminator is what can move it in depth.
+
+One caveat on the interpolation probe: linearly blending two poses in axis-angle space is
+not a valid path between them, which is why the mid-points score *worse* in 2D than either
+end. The endpoint comparison (lifted vs GT) is unaffected and is the number that matters.
+
+### Logged to TensorBoard
+
+The components come back through the env's `info` dict, which skrl's gymnasium wrapper
+passes untouched, and go through `track_data` so skrl averages them and writes at
+`write_interval` rather than once per step.
+
+```
+Reward / reprojection                          the r_reproj term
+Reward / smoothness                            the r_smooth term
+Reprojection / error corrected (px)            interpretable units, not reward units
+Reprojection / error lifted (px)               the same metric on the untouched lifted frame
+Reprojection / improvement over lifted (px)    >0 means the policy is actually helping
+Reprojection / frames with 2D evidence         detection coverage
+Reprojection / joints scored                   how many of the 12 passed the confidence gate
+```
+
+Frames with no 2D evidence carry `nan`, and those are skipped rather than tracked — a single
+`nan` would poison the mean and the curve would silently disappear from TensorBoard.
+
+**"Improvement over lifted" is the one to watch.** Given that the 2D evidence barely
+separates the lifted pose from GT, a rising reward curve on its own proves very little; the
+policy can bank a high reward that the lifted pose had already earned. Scoring the untouched
+lifted frame alongside costs a second forward pass, so it runs every `--baseline_every`
+steps (default 10, ~10% overhead; 0 disables).
+
+### The default policy init cannot train against this reward
+
+Logging the components made this visible immediately. `SkrlPoseActor` initialises
+`log_std = 0`, i.e. an action standard deviation of **1.0 in normalised pose units** — a
+full standard deviation of the pose distribution, per joint, per frame. Measured:
+
+| action std | err_px | r_reproj | r_smooth | combined |
+|---|---|---|---|---|
+| 0.00 (identity) | 15.5 | 0.584 | 0.936 | **0.678** |
+| 0.05 | 15.7 | 0.578 | 0.927 | 0.671 |
+| 0.20 | 18.2 | 0.479 | 0.799 | 0.559 |
+| **1.00 (current default)** | **49.8** | **0.034** | **0.016** | **0.036** |
+
+At std 1.0 both terms are saturated near zero, where `exp(-x²)` is flat — so PPO starts with
+almost no gradient and the first thing it must learn is to undo its own initialisation. The
+identity correction already scores 0.678.
+
+Fix before any (B) run: initialise `log_std` near `log(0.05) ≈ -3` and zero-init the actor's
+final layer so the mean correction starts at identity. Both are standard for residual
+policies and neither is a change to the reward.
+
 ### What is still open for the experiments
 
 - **(C) GAIL/AMP is ready** — GT expert demonstrations are in `gt/`, and AMP state
@@ -406,7 +648,7 @@ cannot be made dramatically faster without invalidating its own output.**
   intrinsics are available, but it turns the reward into a supervised GT loss in disguise —
   the same leakage trap as the fitted offsets in §3.
 
-## 6. TensorBoard pose visualisation
+## 7. TensorBoard pose visualisation
 
 Scalar reward curves do not show whether the policy actually changes the pose.
 `src/viz_pose.py` logs a skeleton overlay so that is visible directly.
@@ -440,7 +682,7 @@ Failures in the visualiser are caught and disable it rather than killing a train
 python -m src.train --h5_path data/processed_movi.h5 --viz_interval 3 --viz_clips 3
 ```
 
-## 7. Open items
+## 8. Open items
 
 - **Betas score 2.7%**, worse than chance, i.e. a lifted shape estimate is usually closer to
   some other clip's GT than to its own. Independent of the camera issue and unexamined.
@@ -463,6 +705,15 @@ python scripts/raw_data_val.py --processed_h5 data/processed_movi.h5
 
 # camera offsets (§3) — needs no calibration files
 python scripts/fit_camera_offset.py --gt_h5 data/movi_smplx.h5 --n_clips 40
+
+# 2D evidence + reprojection targets (§5)
+python scripts/extract_2d.py --out data/keypoints2d.h5        # done; resumable, re-runs as a no-op
+python scripts/build_reproj_targets.py                        # -> data/reproj_targets.h5
+python -m pytest tests/test_reproject.py tests/test_rewards.py -o addopts=""
+
+# training with the GT-free reward (§6) — needs the smplerx env for smplx
+python -m src.train --h5_path data/processed_movi.h5 --reward_mode reproj \
+    --reproj_path data/reproj_targets.h5 --reproj_sigma 0.04
 
 # PA-MPJPE (§4) — needs the smplerx env for smplx + torch
 python -m src.evaluate --processed_h5 data/processed_movi.h5 \

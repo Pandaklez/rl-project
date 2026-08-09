@@ -70,3 +70,21 @@ def correct_root(poses: np.ndarray, camera: str, calib_dir: str | None = None) -
     root = R.from_rotvec(poses[:, 0, :])
     poses[:, 0, :] = (camera_to_world(camera, calib_dir) * root).as_rotvec()
     return poses
+
+
+def uncorrect_root(poses: np.ndarray, camera: str, calib_dir: str | None = None) -> np.ndarray:
+    """
+    Inverse of `correct_root`: world-frame root back into the camera frame.
+
+    A reprojection reward needs this. The dataset stores world-frame poses (the
+    file carries `root_corrected`), but projecting into the image requires the
+    camera frame — and the *corrected* pose coming out of a policy cannot use the
+    stored `root_cam`, which is the untouched lifted root rather than the
+    policy's output.
+
+    poses : (T, 52, 3) axis-angle with a world-frame root
+    """
+    poses = np.asarray(poses, dtype=np.float32).copy()
+    root = R.from_rotvec(poses[:, 0, :])
+    poses[:, 0, :] = (camera_to_world(camera, calib_dir).inv() * root).as_rotvec()
+    return poses
