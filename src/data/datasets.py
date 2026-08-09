@@ -10,9 +10,10 @@ Expected HDF5 layout (produced by data/norm_upsample.py):
 processed_movi.h5
     ├── train/
     │   ├── Subject_1__walking/
-    │   │   ├── poses   (T, 52, 3)   — normalized GT axis-angle
-    │   │   ├── trans   (T,  3)      — normalized GT root translation
-    │   │   ├── betas   (16,)        — normalized GT shape coefficients
+    │   │   ├── gt/
+    │   │   │   ├── poses  (T, 52, 3)  — normalized GT axis-angle
+    │   │   │   ├── trans  (T,  3)     — normalized GT root translation
+    │   │   │   └── betas  (16,)       — normalized GT shape coefficients
     │   │   ├── pg1/
     │   │   │   ├── poses  (T, 52, 3)  — normalized + upsampled lifted (PG1 camera)
     │   │   │   ├── trans  (T,  3)
@@ -33,6 +34,16 @@ Each sample returned by __getitem__ is a (clip_name, camera) pair:
         "y": {"poses": (T,52,3), "trans": (T,3), "betas": (16,)}  — GT target
     }
 """
+
+GT_GROUP = "gt"
+
+
+def gt_group(clip_grp):
+    """
+    GT lives in its own 'gt' subgroup. Files written before that change stored it
+    flat at the clip root, so fall back to the clip group itself for those.
+    """
+    return clip_grp[GT_GROUP] if GT_GROUP in clip_grp else clip_grp
 
 
 class MoViDataset(Dataset):
@@ -84,9 +95,10 @@ class MoViDataset(Dataset):
         data = {"x": {}, "y": {}}
         with h5py.File(self.h5_path, "r") as f:
             clip_grp = f[self.split][clip_name]
+            gt_grp   = gt_group(clip_grp)
             for key in self.keys:
                 data["x"][key] = torch.from_numpy(clip_grp[camera][key][:].astype(np.float32)).to(self.device)
-                data["y"][key] = torch.from_numpy(clip_grp[key][:].astype(np.float32)).to(self.device)
+                data["y"][key] = torch.from_numpy(gt_grp[key][:].astype(np.float32)).to(self.device)
         return data
     
 # TODO: Anya: check length and norm stats, unnormalization - round trip, visualize before & after renders

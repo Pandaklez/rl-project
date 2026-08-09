@@ -3,6 +3,11 @@ import h5py
 import argparse
 import json
 import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from src.camera_frame import correct_root  # noqa: E402
 
 FRAMERATE = 120  # Hz — fixed for MoVi
 
@@ -65,7 +70,14 @@ def create_split_index(data_file, index_out_file):
     with open(index_out_file, "w") as file:
         json.dump(split_index, file)
 
-def create_normalization(data_file, norm_out_file,camera = None):
+def create_normalization(data_file, norm_out_file, camera=None, correct=False, calib_dir=None):
+    """
+    Compute mu/sigma over the train split.
+
+    When `correct` is set the lifted root is rotated into the world frame first,
+    so the stats describe the same data the clips are normalized against. The
+    flag is recorded in the file so a stale mismatch can be detected on load.
+    """
     print(f"Normalizing {norm_out_file}...")
     stats = {}
     for ds in ["poses","trans", "betas"]:
@@ -76,21 +88,33 @@ def create_normalization(data_file, norm_out_file,camera = None):
                     ex = data_file["train"][key][camera]
                 except:
                     continue # Just move on with loop if camera lacking for clip
-            else: 
+            else:
                 ex = data_file["train"][key]
-            raw_data.append(ex[ds])
+            arr = ex[ds][:]
+            if correct and camera and ds == "poses":
+                arr = correct_root(arr, camera, calib_dir)
+            raw_data.append(arr)
         if ds == "betas":
             np_data = np.stack(raw_data,axis = 0)
         else:
-            np_data = np.concat(raw_data,axis = 0)
+            np_data = np.concatenate(raw_data,axis = 0)
         stats[ds] = {
             "shape" : np_data.shape,
             "mu" : np_data.mean(axis=0).tolist(),
             "sigma" : np_data.std(axis=0).tolist()
         }
+    stats["_root_corrected"] = bool(correct and camera)
     with open(norm_out_file,"w") as dump_file:
         json.dump(stats,dump_file)
-    
+
+
+def norm_is_stale(path, want_corrected):
+    """True if an existing norm file was built under a different correction setting."""
+    if not os.path.exists(path):
+        return False
+    with open(path) as f:
+        return bool(json.load(f).get("_root_corrected", False)) != bool(want_corrected)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -111,7 +135,15 @@ def main():
                         help="Normalization stats for PG2 lifted data")
     parser.add_argument("--out_hdf5",    default="data/processed_movi.h5",
                         help="Output path for the normalized, merged HDF5")
+    parser.add_argument("--calib_dir",   default="data/Calib",
+                        help="MoVi camera calibration (Extrinsics_PGX.npz, cameraParams_PGX.npz)")
+    parser.add_argument("--no_correct_root", action="store_true",
+                        help="Skip rotating the lifted root into the world frame. The raw "
+                             "SMPLer-X root is camera-relative and sits ~95 deg (PG1) / "
+                             "~120 deg (PG2) from GT — see src/camera_frame.py")
     args = parser.parse_args()
+
+    correct = not args.no_correct_root
 
     movi_h5   = h5py.File(args.movi_path,   "r")
     lifted_h5 = h5py.File(args.lifted_path, "r")
@@ -132,10 +164,13 @@ def main():
 
     if not os.path.exists(gt_norm_path):
         create_normalization(movi_h5,gt_norm_path)
-    if not os.path.exists(pg1_norm_path):
-        create_normalization(lifted_h5,pg1_norm_path,"PG1")
-    if not os.path.exists(pg2_norm_path):
-        create_normalization(lifted_h5,pg2_norm_path,"PG2")
+    for path, cam in ((pg1_norm_path, "PG1"), (pg2_norm_path, "PG2")):
+        if norm_is_stale(path, correct):
+            print(f"  {os.path.basename(path)} was built with root_corrected="
+                  f"{not correct}, regenerating")
+            os.remove(path)
+        if not os.path.exists(path):
+            create_normalization(lifted_h5, path, cam, correct, args.calib_dir)
 
     gt_norm_stats  = json.load(open(gt_norm_path))
     pg1_norm_stats = json.load(open(pg1_norm_path))
@@ -145,6 +180,23 @@ def main():
     out_file.attrs["description"] = "MoVi — normalized GT + lifted poses per action clip"
     out_file.attrs["framerate"]   = FRAMERATE
     out_file.attrs["n_joints"]    = 52
+    out_file.attrs["root_corrected"] = correct
+    out_file.attrs["root_note"] = (
+        "lifted poses[:,0] is world-frame when root_corrected; the untouched "
+        "camera-frame root is kept per camera as 'root_cam' (unnormalized). "
+        "lifted 'trans' is virtual-camera depth from SMPLer-X, NOT metres."
+    )
+
+    # Embed the calibration so downstream reprojection does not need data/Calib.
+    calib_out = out_file.create_group("calib")
+    for cam_out, cam_src in (("pg1", "PG1"), ("pg2", "PG2")):
+        cg = calib_out.create_group(cam_out)
+        for fname, keys in (("cameraParams", ("IntrinsicMatrix", "RadialDistortion")),
+                            ("Extrinsics",   ("rotationMatrix", "translationVector"))):
+            src = np.load(os.path.join(args.calib_dir, f"{fname}_{cam_src}.npz"))
+            for k in keys:
+                cg.create_dataset(k, data=src[k])
+        cg.attrs["note"] = "MATLAB row-vector convention: X_cam = X_world @ R + t"
 
     cam_norm = {"pg1": pg1_norm_stats, "pg2": pg2_norm_stats}
 
@@ -179,16 +231,28 @@ def main():
                     print(f"  warn  {split}/{clip_name}: missing {cam_src} in lifted h5, skipping camera")
                     continue
                 cam_grp = grp_lifted[clip_name][cam_src]
+                raw_poses = cam_grp["poses"][:]
+                # Keep the untouched camera-frame root: it is what a reprojection
+                # reward needs to get back into the image, and it is the only part
+                # of the lifted pose the correction changes.
+                root_cam = raw_poses[:, 0, :].copy()
+                src_clip = {
+                    "poses": correct_root(raw_poses, cam_src, args.calib_dir) if correct else raw_poses,
+                    "trans": cam_grp["trans"][:],
+                    "betas": cam_grp["betas"][:],
+                }
                 try:
-                    cam_norm_data = normalize_clip(cam_grp, clip_name, cam_norm[cam_out])
+                    cam_norm_data = normalize_clip(src_clip, clip_name, cam_norm[cam_out])
                 except Exception as e:
                     print(f"  warn  {split}/{clip_name}/{cam_src}: normalisation failed — {e}")
                     continue
                 poses_up, trans_up = upsample(cam_norm_data["poses"], cam_norm_data["trans"], T_gt)
+                root_cam_up, _ = upsample(root_cam[:, None, :], cam_norm_data["trans"], T_gt)
                 lifted_norm[cam_out] = {
                     "poses": poses_up,
                     "trans": trans_up,
                     "betas": cam_norm_data["betas"],
+                    "root_cam": root_cam_up[:, 0, :],
                 }
 
             if not lifted_norm:
@@ -202,7 +266,7 @@ def main():
                 gt_grp.create_dataset(key, data=gt_norm[key], compression="gzip", compression_opts=4, chunks=True)
             for cam_out, cam_data in lifted_norm.items():
                 cam_grp = g.create_group(cam_out)
-                for key in ("poses", "trans", "betas"):
+                for key in ("poses", "trans", "betas", "root_cam"):
                     cam_grp.create_dataset(key, data=cam_data[key], compression="gzip", compression_opts=4, chunks=True)
 
             for attr_key, attr_val in gt_clip.attrs.items():

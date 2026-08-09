@@ -31,9 +31,10 @@ import h5py
 import numpy as np
 import torch
 
-from src.data.datasets import MoViDataset
+from src.data.datasets import MoViDataset, gt_group
 from src.env import MoviEnv
 from src.models.policy import PoseActor, flatten_state, unflatten_action
+from src.smplx_fk import joints_from_poses
 
 
 # ─── Procrustes ───────────────────────────────────────────────────────────────
@@ -66,7 +67,13 @@ def procrustes_align(pred: torch.Tensor, gt: torch.Tensor) -> torch.Tensor:
 
 
 def pa_mpjpe(pred: torch.Tensor, gt: torch.Tensor) -> float:
-    """Mean PA-MPJPE over all frames and joints. pred/gt: (T, J, 3)."""
+    """
+    Mean PA-MPJPE in metres over all frames and joints.
+
+    pred/gt must be 3D joint POSITIONS (T, J, 3) from the body model — see
+    src/smplx_fk.joints_from_poses. Passing axis-angle pose vectors here yields
+    a number with no geometric meaning.
+    """
     return (procrustes_align(pred, gt) - gt).pow(2).sum(dim=-1).sqrt().mean().item()
 
 
@@ -106,6 +113,7 @@ def eval_lifted_baseline(
     norm_stats: dict,
     cameras: tuple[str, ...],
     split: str,
+    device: str = "cpu",
 ) -> dict:
     scores: list[float] = []
 
@@ -115,12 +123,18 @@ def eval_lifted_baseline(
         clip_names = list(proc_f[split].keys())
         for i, clip_name in enumerate(clip_names):
             # GT: unnormalize from processed_movi.h5
-            gt_norm = proc_f[split][clip_name]["poses"][:].astype(np.float32)
-            gt      = unnormalize_np(gt_norm, "poses", norm_stats)   # (T, J, 3)
-            T       = gt.shape[0]
+            gt_grp  = gt_group(proc_f[split][clip_name])
+            gt_pose = unnormalize_np(gt_grp["poses"][:].astype(np.float32), "poses", norm_stats)
+            betas   = unnormalize_np(gt_grp["betas"][:].astype(np.float32), "betas", norm_stats)
+            T       = gt_pose.shape[0]
 
             if clip_name not in lift_f[split]:
                 continue
+
+            # GT betas are used for both sides so the metric reflects pose error
+            # alone; the lifted shape estimate is near-chance and would only add
+            # noise to a pose benchmark.
+            gt_joints = joints_from_poses(gt_pose, betas, device=device)
 
             clip_scores: list[float] = []
             for cam in cameras:
@@ -129,8 +143,8 @@ def eval_lifted_baseline(
                 lift_raw = lift_f[split][clip_name][cam]["poses"][:].astype(np.float32)
                 lift_up  = upsample_to(lift_raw, T)                   # (T, J, 3)
                 clip_scores.append(pa_mpjpe(
-                    torch.from_numpy(lift_up),
-                    torch.from_numpy(gt),
+                    joints_from_poses(lift_up, betas, device=device),
+                    gt_joints,
                 ))
 
             if clip_scores:
@@ -179,7 +193,11 @@ def eval_model(
         corr = unnormalize_t(corr_n, "poses", norm_stats)
         gt   = unnormalize_t(gt_n,   "poses", norm_stats)
 
-        corrected_scores.append(pa_mpjpe(corr, gt))
+        betas = unnormalize_t(y["betas"].cpu(), "betas", norm_stats)
+        corrected_scores.append(pa_mpjpe(
+            joints_from_poses(corr, betas, device=str(device)),
+            joints_from_poses(gt,   betas, device=str(device)),
+        ))
 
         if (idx + 1) % 20 == 0:
             print(f"  [model {idx+1:4d}/{len(dataset)}]  PA-MPJPE={np.mean(corrected_scores):.5f}")
@@ -217,7 +235,7 @@ def main() -> None:
         print(f"\n── Raw lifted baseline (GT from {args.processed_h5}, unnormalized) ──")
         res = eval_lifted_baseline(
             args.lifted_h5, args.processed_h5,
-            norm_stats, tuple(args.cameras), args.split,
+            norm_stats, tuple(args.cameras), args.split, args.device,
         )
         all_results.update(res)
         print(f"  PA-MPJPE lifted (raw)  : {res['pa_mpjpe_lifted_raw']:.5f}  ({res['n_clips_baseline']} clips)")

@@ -22,6 +22,43 @@ from skrl.trainers.torch import SequentialTrainer
 from src.data.datasets import MoViDataset
 from src.env import GymMoviEnv
 from src.models.policy import SkrlPoseActor, SkrlPoseCritic
+from src.viz_pose import PoseVizLogger
+
+
+class PPOWithPoseViz(PPO):
+    """
+    PPO plus a periodic 2D skeleton overlay in TensorBoard.
+
+    The figure is expensive relative to a scalar (it rolls the policy out over a
+    few validation clips and runs SMPL-X forward), so it is logged every
+    `viz_interval` updates rather than every step.
+    """
+
+    def __init__(self, *args, viz_logger=None, viz_interval: int = 3, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._viz_logger = viz_logger
+        self._viz_interval = viz_interval
+        self._update_count = 0
+
+    def post_interaction(self, timestep: int, timesteps: int) -> None:
+        # Mirror PPO's own trigger so we know an update is about to happen.
+        updating = (not (self._rollout + 1) % self._rollouts
+                    and timestep >= self._learning_starts)
+        super().post_interaction(timestep, timesteps)
+
+        if not (updating and self._viz_logger):
+            return
+        self._update_count += 1
+        if self._update_count % self._viz_interval:
+            return
+
+        for tag, value in self._viz_logger.correction_magnitude().items():
+            self.writer.add_scalar(tag, value, timestep)
+        fig = self._viz_logger()
+        if fig is not None:
+            self.writer.add_figure("pose/lifted_vs_corrected_vs_gt", fig, timestep)
+            import matplotlib.pyplot as plt
+            plt.close(fig)
 
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -61,6 +98,9 @@ class Config:
     out_dir:             str = "checkpoints"
     log_interval:        int = 200   # TensorBoard write interval (timesteps)
     checkpoint_interval: int = 0     # skrl checkpoint interval (0 = end only)
+    viz_interval:        int = 3     # log the 2D skeleton figure every N updates (0 = off)
+    viz_clips:           int = 3     # held-out val clips shown per figure
+    viz_frames:          int = 4     # frames sampled per clip
 
     # Misc
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -130,14 +170,32 @@ def train(cfg: Config) -> None:
     ppo_cfg["experiment"]["write_interval"]      = cfg.log_interval
     ppo_cfg["experiment"]["checkpoint_interval"] = cfg.checkpoint_interval
 
+    # ── Pose visualisation on held-out clips ─────────────────────────────────
+    viz_logger = None
+    if cfg.viz_interval > 0:
+        try:
+            viz_dataset = MoViDataset(cfg.h5_path, cfg.norm_stats_path, split="val")
+            import json
+            with open(cfg.norm_stats_path) as f:
+                viz_stats = json.load(f)
+            viz_logger = PoseVizLogger(
+                viz_dataset, actor, viz_stats, device=cfg.device,
+                n_clips=cfg.viz_clips, n_frames=cfg.viz_frames, seed=cfg.seed,
+            )
+            print(f"Pose viz: {cfg.viz_clips} val clips every {cfg.viz_interval} updates")
+        except Exception as e:                       # never let logging kill a run
+            print(f"Pose viz disabled: {type(e).__name__}: {e}")
+
     # TODO: train.py: Do we need to use PPO or PPO_RNN?
-    agent = PPO(
+    agent = PPOWithPoseViz(
         models={"policy": actor, "value": critic},
         memory=memory,
         cfg=ppo_cfg,
         observation_space=obs_space,
         action_space=act_space,
         device=device,
+        viz_logger=viz_logger,
+        viz_interval=cfg.viz_interval,
     )
 
     # ── Trainer ──────────────────────────────────────────────────────────────
@@ -181,6 +239,10 @@ def main() -> None:
     parser.add_argument("--out_dir",             default="checkpoints")
     parser.add_argument("--log_interval",        type=int,   default=200)
     parser.add_argument("--checkpoint_interval", type=int,   default=0)
+    parser.add_argument("--viz_interval",        type=int,   default=3,
+                        help="log the 2D skeleton overlay every N PPO updates (0 disables)")
+    parser.add_argument("--viz_clips",           type=int,   default=3)
+    parser.add_argument("--viz_frames",          type=int,   default=4)
     parser.add_argument("--device",              default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--seed",                type=int,   default=42)
     args = parser.parse_args()

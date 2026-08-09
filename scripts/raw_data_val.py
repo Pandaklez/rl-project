@@ -82,7 +82,7 @@ def val_norm_stats(data, split, camera, ds):
         print(f'\t sigma: {np_data.std(axis = 0).mean()}')
 
     else:
-        np_data = np.concat(raw_data,axis = 0)
+        np_data = np.concatenate(raw_data,axis = 0)
         print(f"n_missing: {n_missing}")
         print(f'\t shape: {np_data.shape}')
         print(f'\t mu: {np_data.mean(axis=0).mean().mean()}')
@@ -97,6 +97,9 @@ def rmse(a, b):
 
 
 def val_rmse(h5):
+    """
+    Validate RMSE between predicted and ground truth data for each split and dataset.
+    """
     datasets = ["poses", "trans", "betas"]
 
     for split in ["train", "val", "test"]:
@@ -115,7 +118,7 @@ def val_rmse(h5):
             pg2_other = []
 
             for i, clip in enumerate(clips):
-                other_clip = clips[i - 1]  
+                other_clip = clips[i - 1]   # Use the previous clip in the list as the "other" clip for comparison
 
                 gt = np.asarray(h5[split][clip]["gt"][ds])
                 gt_other = np.asarray(h5[split][other_clip]["gt"][ds])
@@ -146,11 +149,25 @@ def val_rmse(h5):
             )
 
 
+# Current — GT rebuilt in SMPL-X format (data/movi_smplx.h5), lifted upd2, 1779 clips.
+#===== TRAIN =====
+#poses  | PG1: 96.1% (RMSE 1.1779 vs 1.3471) | PG2: 93.9% (RMSE 1.1985 vs 1.3455)
+#trans  | PG1: 58.3% (RMSE 0.9061 vs 1.0245) | PG2: 56.8% (RMSE 0.9468 vs 1.0473)
+#betas  | PG1: 2.7% (RMSE 1.2046 vs 1.2074) | PG2: 2.6% (RMSE 1.1940 vs 1.1938)
+#===== VAL =====
+#poses  | PG1: 96.3% (RMSE 1.1769 vs 1.3521) | PG2: 90.4% (RMSE 1.2338 vs 1.3741)
+#trans  | PG1: 56.9% (RMSE 0.8842 vs 1.0057) | PG2: 54.8% (RMSE 0.9213 vs 1.0253)
+#betas  | PG1: 4.3% (RMSE 1.1603 vs 1.1628) | PG2: 3.2% (RMSE 1.1337 vs 1.1385)
+#===== TEST =====
+#poses  | PG1: 97.3% (RMSE 1.1772 vs 1.3397) | PG2: 95.7% (RMSE 1.1875 vs 1.3294)
+#trans  | PG1: 57.2% (RMSE 0.8749 vs 0.9843) | PG2: 56.7% (RMSE 0.9387 vs 1.0279)
+#betas  | PG1: 3.7% (RMSE 1.2865 vs 1.3017) | PG2: 2.7% (RMSE 1.2155 vs 1.2251)
+#
+# For reference, the same test against the OLD SMPL-H GT scored ~50% on poses
+# (i.e. chance). Poses at 96%+ is the SMPL-H -> SMPL-X fix landing.
+# trans stays near chance because the lifted translation is virtual-camera depth
+# (fake 5000px focal), not metres — see scripts/fit_camera_offset.py.
 
-
-        
-
-    
 
 def main():
     parser = argparse.ArgumentParser()

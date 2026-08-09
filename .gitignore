@@ -17,11 +17,19 @@ __pycache__/
 *.avi
 *.zip
 *.tar
+*.tar.bz2
+*.tar.gz
 *.jpg
 # other
 .vscode
 
 checkpoints/
+
+# Large data artifacts. Files already tracked under data/ (norm stats,
+# split_index.json, _archive/, Calib/, the BMLmovi LICENSE) stay tracked —
+# .gitignore only affects untracked paths.
+data/
+data/*
 
 demo/*
 .claude/*
@@ -32,10 +40,6 @@ output/
 *.pth
 pretrained_models/
 transformer_utils/
-
-# 3D lifting 
-smpler-x-main/
-smpler-x-main/*
 
 # C extensions
 *.so

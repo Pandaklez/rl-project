@@ -25,16 +25,19 @@ HDF5 layout:
     ├── val/  ...
     └── test/ ...
 
-Usage:
-    python pack_movi_hdf5.py \\
+Usage: 
+python3 pack_movi_hdf5.py --mat_dir /home/annkle/rl-project/AMASS --out_hdf5 movi.h5 --split split_index.json --seed 42
+    python data/pack_movi_hdf5.py \\
         --mat_dir    data/F_amass/ \\
         --out_hdf5   movi.h5 \\
-        --train_frac 0.80 \\
-        --val_frac   0.10 \\
+        --split      split_index.json \\
         --seed       42
 """
 
+from __future__ import annotations
+
 import argparse
+import json
 import logging
 import random
 from pathlib import Path
@@ -135,16 +138,20 @@ def load_amass_mat(path: Path) -> tuple[dict, list[dict]] | tuple[None, None]:
             log.warning(f"  Could not unwrap action cell in {meta['id']}, skipping. "
                         f"Final type: {type(action).__name__}")
             continue
-
-        poses = action.jointsExpMaps_amass.astype(np.float32)    # (T, 52, 3)
+        
+        poses = action.jointsExpMaps_amass.astype(np.float32)  # (T, 52, 3)
+        locations = action.jointsLocation_amass.astype(np.float32)  # (T, 52, 3)
         trans = action.RootTranslation_amass.astype(np.float32)  # (T, 3)
         betas = action.jointsBetas_amass.astype(np.float32).reshape(16)  # (16,)
+        joint_parents = action.jointsParent.astype(np.int32).reshape(52)  # (52,)
 
         clips.append({
             "action": _str(action.description),
             "poses":  poses,
             "trans":  trans,
             "betas":  betas,
+            "locations": locations,
+            "joint_parents": joint_parents,
             "T":      poses.shape[0],
         })
 
@@ -183,6 +190,49 @@ def subject_split(
     return splits
 
 
+def subject_split_from_json(
+    mat_files:  list[Path],
+    split_path: Path,
+) -> dict[str, list[Path]]:
+    """
+    Load a precomputed clip-level split (as produced by a previous run of
+    this script) and turn it back into a subject-level {split: [mat_path]}
+    mapping. Clip names have the form "<subject_id>__<action>", so the
+    subject id is the part before the first double underscore; every clip
+    for a subject was written under the same split, so this recovers a
+    1:1 subject->split assignment.
+
+    Subjects present in `mat_files` but absent from the split file (e.g.
+    they failed to load in the run that produced the split) are skipped.
+    """
+    split_index = json.loads(Path(split_path).read_text())
+
+    subject_to_split: dict[str, str] = {}
+    for split, clip_names in split_index.items():
+        for clip_name in clip_names:
+            subject_id = clip_name.split("__", 1)[0]
+            subject_to_split[subject_id] = split
+
+    splits: dict[str, list[Path]] = {"train": [], "val": [], "test": []}
+    skipped = []
+    for mat_path in sorted(mat_files):
+        subject_id = mat_path.stem.replace("F_amass_", "", 1)
+        split = subject_to_split.get(subject_id)
+        if split is None:
+            skipped.append(subject_id)
+            continue
+        splits[split].append(mat_path)
+
+    for s, fl in splits.items():
+        log.info(f"  {s:5s}: {len(fl):3d} subjects")
+    if skipped:
+        log.warning(
+            f"  {len(skipped)} subject(s) not found in {split_path}, skipping: "
+            f"{', '.join(skipped)}"
+        )
+    return splits
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HDF5 writer
 # ─────────────────────────────────────────────────────────────────────────────
@@ -203,7 +253,7 @@ def write_clip(
         counter += 1
     g = grp.create_group(unique_name)
 
-    for key in ("poses", "trans", "betas"):
+    for key in ("poses", "trans", "betas", "locations", "joint_parents"):
         g.create_dataset(
             key,
             data             = clip[key],
@@ -234,6 +284,11 @@ def main():
                         help="Directory containing F_amass_Subject_*.mat files")
     parser.add_argument("--out_hdf5",   required=True,
                         help="Output path, e.g. movi.h5")
+    parser.add_argument("--split",      default=None,
+                        help="Path to a precomputed split_index.json "
+                             "(subject-level split recovered from clip "
+                             "names). If given, overrides --train_frac/"
+                             "--val_frac/--seed.")
     parser.add_argument("--train_frac", type=float, default=0.80)
     parser.add_argument("--val_frac",   type=float, default=0.10)
     parser.add_argument("--seed",       type=int,   default=42)
@@ -247,7 +302,11 @@ def main():
         raise FileNotFoundError(f"No F_amass_Subject_*.mat files in {mat_dir}")
     log.info(f"Found {len(mat_files)} .mat files")
 
-    splits = subject_split(mat_files, args.train_frac, args.val_frac, args.seed)
+    if args.split:
+        log.info(f"Using precomputed split from {args.split}")
+        splits = subject_split_from_json(mat_files, Path(args.split))
+    else:
+        splits = subject_split(mat_files, args.train_frac, args.val_frac, args.seed)
     counts = {"train": 0, "val": 0, "test": 0, "skipped": 0}
 
     with h5py.File(args.out_hdf5, "w") as h5f:
