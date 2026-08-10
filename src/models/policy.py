@@ -12,6 +12,28 @@ BETAS_DIM = 16
 FRAME_DIM = POSE_DIM + TRANS_DIM        # 159 — one frame of poses + trans
 STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1}
 
+# Action layout. The *state* always carries both poses and trans; only the
+# action shrinks.
+#
+# §2 of the handover: the lifted `trans` is not a translation in metres. It is
+# SMPLer-X's cam_trans in a cropped-bbox virtual camera with a 5000 px focal, so
+# a subject 4.5 m away is stored at z ~= 42. There is no rigid transform from it
+# to the room, and it is the field that sits at ~57% in val_rmse and does not
+# improve from pose work. Predicting a correction to it asks the policy to
+# regress a quantity whose units it cannot see, and PA-MPJPE is Procrustes-
+# aligned so the metric never depended on it either.
+#
+# Pose-only is therefore the default: 156 dims, no trans delta. `trans` stays in
+# the observation, because apparent size in the image is genuine information
+# about depth even when the number is not metric.
+ACTION_DIM_POSE_ONLY = POSE_DIM         # 156 — poses only (default)
+ACTION_DIM_WITH_TRANS = FRAME_DIM       # 159 — poses + trans (ablation)
+
+
+def action_dim(predict_trans: bool = False) -> int:
+    """Width of the policy's action vector."""
+    return ACTION_DIM_WITH_TRANS if predict_trans else ACTION_DIM_POSE_ONLY
+
 
 def _mlp(
     dims: list[int],
@@ -56,10 +78,32 @@ def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     Split a flat action vector back into the dict format expected by MoviEnv.step().
 
-    action: (..., FRAME_DIM)  →  {"poses": (..., 52, 3), "trans": (..., 3)}
+    Both action widths are accepted, and which one it is follows from the width
+    itself rather than from a flag the caller has to keep in sync:
+
+        (..., 156)  poses only     -> trans delta is exactly zero
+        (..., 159)  poses + trans  -> trans delta comes from the action
+
+    The zero trans delta is what makes pose-only training work without touching
+    `MoviEnv.step`: `corrected = lifted + 0` passes the lifted translation
+    through untouched, so downstream FK and projection still get a translation,
+    it is simply not one the policy chose.
+
+    Reading the width also means a checkpoint trained either way loads and rolls
+    out correctly in `evaluate.py` / `viz_pose.py` without a flag at the call
+    site — the tensor says which it is.
     """
-    poses_flat = action[..., :POSE_DIM]
-    trans      = action[..., POSE_DIM:]
+    width = action.shape[-1]
+    if width == ACTION_DIM_WITH_TRANS:
+        poses_flat = action[..., :POSE_DIM]
+        trans      = action[..., POSE_DIM:]
+    elif width == ACTION_DIM_POSE_ONLY:
+        poses_flat = action
+        trans      = action.new_zeros((*action.shape[:-1], TRANS_DIM))
+    else:
+        raise ValueError(
+            f"action width {width} is neither {ACTION_DIM_POSE_ONLY} (poses only) "
+            f"nor {ACTION_DIM_WITH_TRANS} (poses + trans)")
     return {
         "poses": poses_flat.unflatten(-1, (N_JOINTS, 3)),
         "trans": trans,
@@ -105,11 +149,13 @@ class PoseActor(nn.Module):
         hidden_dims: tuple[int, ...] = (512, 256),
         dropout:     float         = 0.0,
         init_log_std: float        = INIT_LOG_STD,
+        predict_trans: bool        = False,
     ):
         super().__init__()
         state_dim    = STATE_DIM + (BETAS_DIM if use_betas else 0)
-        self.net     = _mlp([state_dim, *hidden_dims, FRAME_DIM], dropout=dropout)
-        self.log_std = nn.Parameter(torch.full((FRAME_DIM,), float(init_log_std)))
+        act_dim      = action_dim(predict_trans)
+        self.net     = _mlp([state_dim, *hidden_dims, act_dim], dropout=dropout)
+        self.log_std = nn.Parameter(torch.full((act_dim,), float(init_log_std)))
         self._init_weights()
 
     def _init_weights(self) -> None:

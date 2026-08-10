@@ -82,6 +82,20 @@ log = logging.getLogger(__name__)
 
 FRAMERATE = 30  # Hz — SMPLer-X inference was run at 30 fps
 
+# `trans` here is SMPLer-X's `cam_trans`, stored under the name `transl` at
+# inference.py:152. It is NOT metres: get_camera_trans() derives depth from a
+# virtual focal length of 5000 px in the cropped-bbox camera, so a subject 4.5 m
+# from the lens comes out at z ~= 42. Recovering metres needs the per-frame bbox
+# and the real intrinsics — see src/reproject.py (crop_intrinsics,
+# metric_translation). It also positions the model origin, not the pelvis;
+# place_in_camera() handles that.
+TRANS_UNITS = (
+    "SMPLer-X cam_trans in the cropped-bbox VIRTUAL camera (focal 5000 px) — "
+    "NOT metres. Convert with src/reproject.py:metric_translation, which needs "
+    "the per-frame bbox and the real intrinsics. Positions the model origin, "
+    "not the pelvis (see src/reproject.py:place_in_camera)."
+)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # MAT helpers (reused from movi_raw_processing.py)
@@ -298,7 +312,7 @@ def main():
         h5f.attrs["framerate"]    = FRAMERATE
         h5f.attrs["n_joints"]     = 52
         h5f.attrs["pose_shape"]   = "T x 52 x 3  (axis-angle, radians)"
-        h5f.attrs["trans_units"]  = "metres"
+        h5f.attrs["trans_units"]  = TRANS_UNITS
         h5f.attrs["joint_layout"] = (
             "joint[0]=root  joint[1-21]=body  "
             "joint[22-36]=left_hand  joint[37-51]=right_hand"

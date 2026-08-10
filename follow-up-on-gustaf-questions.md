@@ -7,7 +7,7 @@ the answer, and which script produces it.
 
 | script | what it does |
 |---|---|
-| `scripts/fit_camera_offset.py` | Recovers the per-camera root rotation offset directly from data, no calibration files needed |
+| `scripts/fit_camera_offset.py` | Recovers the per-camera root rotation offset directly from data, no calibration files needed (But they should be used though, I just need to get to my hard drive) |
 | `src/camera_frame.py` | **The fix.** Rotates a lifted root into the world frame using calibration only — no GT involved |
 | `src/smplx_fk.py` | SMPL-X forward kinematics: axis-angle pose params -> 3D joint positions |
 | `src/viz_pose.py` | TensorBoard 2D skeleton overlays (lifted / corrected / GT) on held-out clips |
@@ -16,6 +16,7 @@ the answer, and which script produces it.
 | `scripts/build_reproj_targets.py` | Builds `data/reproj_targets.h5`, the reprojection targets |
 | `src/rewards.py` | **The GT-free reward.** Reprojection + smoothness for experiments (B)/(C) |
 | `tests/test_reproject.py`, `tests/test_rewards.py` | 41 tests pinning the conversion, the resampling rule and the reward |
+| `tests/test_action_layout.py` | 11 tests pinning the pose-only action (§2) and the trans pass-through |
 | `scripts/migrate_gt_layout.py` | One-off in-place migration of an old flat `processed_movi.h5` to the `gt/` subgroup layout |
 
 **Files changed**: `src/evaluate.py`, `src/data/datasets.py`, `src/env.py`, `src/train.py`,
@@ -77,7 +78,7 @@ Keeping it. It is the cleaner structure, and it is what made the two bugs below 
 
 ### "Final validation of re-rendering, I leave this to you"
 
-Deferred, and there is a reason to do it *after* §3: the metric it would have been validated
+Deferred, and there is a reason to do it after §3: the metric it would have been validated
 against was broken. See §4.
 
 ---
@@ -111,6 +112,38 @@ Consequences:
 
 Recommendation: drop absolute translation, train on pose. PA-MPJPE Procrustes-aligns anyway,
 so the metric never depended on it — `src/smplx_fk.py` zeroes `transl` explicitly.
+
+### Done — the policy now trains on pose alone
+
+The action dropped from **159 dims to 156**: 52×3 axis-angles, no translation delta. This is
+the default; `--predict_trans` restores the old 159-d action as an ablation.
+
+What changed, and what deliberately did not:
+
+- **`trans` stays in the observation.** Only the action shrinks, so `STATE_DIM` is still 318.
+  Apparent size in the image is genuine information about depth even when the stored number
+  is not metric, and there is no reason to blind the policy to it.
+- **The lifted translation is passed through untouched.** `unflatten_action` returns an
+  exactly-zero trans delta for a 156-d action, so `corrected = lifted + 0` and every
+  downstream consumer — FK, `place_in_camera`, projection — still receives a translation. It
+  is simply not one the policy chose. `tests/test_action_layout.py` pins this bit-for-bit,
+  because a trans delta leaking back in would move the body in depth and nothing else
+  would fail.
+- **The reprojection reward now reads the sidecar** (`correct_translation=False`). With the
+  policy unable to move `trans` there is nothing to re-derive, so the reward uses the metric
+  translation `build_reproj_targets.py` already computed — the exact path the 11.6 / 14.5 px
+  validation measured.
+- **The GT-mode reward stops scoring `trans`** (`compute_reward(..., keys=("poses",))`).
+  Leaving it in would have added the lifted-vs-GT translation error to every reward: a
+  constant the policy cannot affect, harmless for the gradient but a large per-clip offset
+  in the value target for nothing.
+- **Action width is read from the checkpoint, not assumed.** `unflatten_action` dispatches on
+  the tensor width and `src/evaluate.py` infers it from `log_std`, so checkpoints from either
+  regime load and roll out without a flag at the call site.
+
+Smoke-tested end to end on the reprojection reward: 156-d action, 334,904 actor params
+(159-d: 335,678), rollouts, PPO updates, the TensorBoard figure and the `pose/*` scalars all
+produced. `tests/test_action_layout.py` — 11 tests, all passing.
 
 ---
 
@@ -463,26 +496,6 @@ upsampling 17 keypoints fourfold would quadruple the file for no information.
 Coverage: 591,013 target frames, per-clip valid fraction **1.000 median, 0.932 worst**,
 no clip below 0.9.
 
-### Optimisation: mostly a dead end, and here is the evidence
-
-Profiled per frame: **decode 0.95 ms, detection 25.2 ms, ViTPose ~1.0 ms**. Detection is
-~93% of the cost, so only detection matters. (An early reading of 22 ms for ViTPose was
-cudnn autotuning warmup, not steady state.)
-
-| idea | result | verdict |
-|---|---|---|
-| Batch the detector | 25.2 -> 35.3 ms/frame | **slower** — mmdet pads to a common size |
-| fp16 detector | 1.06x, bboxes shift up to 7.8 px | rejected — negligible gain, breaks fidelity |
-| Parallel workers | 40 -> 45 fps aggregate | GPU already saturated; ~12% for real complexity |
-| Lower `img_scale` | 1.5-1.9x, bboxes shift 9-23 px | rejected — ~5% depth error |
-| Skip frames no clip uses | ~15% fewer frames | **kept** (`flags30` ranges) |
-| GPU-side preprocessing | 0.35 -> 0.03 ms/frame | kept |
-| cudnn.benchmark + ViT batch 128 | 1.04 -> 0.72 ms/frame | kept |
-
-The three rejected ideas all trade bbox fidelity for speed, and bbox fidelity is exactly
-what makes the recovered translation consistent with the existing lifted poses. **The job
-cannot be made dramatically faster without invalidating its own output.**
-
 ### Folded into the loader
 
 `MoViDataset(..., reproj_path="data/reproj_targets.h5")` adds a `reproj` key to each
@@ -686,18 +699,25 @@ python -m src.train --h5_path data/processed_movi.h5 --viz_interval 3 --viz_clip
 
 - **Betas score 2.7%**, worse than chance, i.e. a lifted shape estimate is usually closer to
   some other clip's GT than to its own. Independent of the camera issue and unexamined.
-- **`movi_smplx_processing.py` is committed twice, and the copies are no longer identical.**
-  They were byte-identical when both landed in `3a3c723`, but the `from __future__ import
-  annotations` fix from §1 was applied to `scripts/` only (in `97cf7ab`). The `data/` copy
-  never got it, so it now **crashes on the `smplerx` env** — `TypeError: 'type' object is
-  not subscriptable`, the `list[int]` annotation evaluated at def-time — while `scripts/`
-  imports cleanly. Verified on Python 3.8.20 and 3.12.4. That makes the `data/` copy not
-  merely redundant but the broken one, and it is the copy sitting next to the data a
-  newcomer would reach for. `scripts/` is canonical; the `data/` copy should go (it is
-  git-tracked, so removal is recoverable).
-- **`smplx_to_h5.py:303`** sets `trans_units = "metres"`, wrong for the lifted groups (§2).
-  Worth revisiting in light of §5: the units are now *recoverable* — `src/reproject.py`
-  converts them — so the attribute could be corrected rather than merely flagged.
+- ~~**`movi_smplx_processing.py` is committed twice, and the copies are no longer
+  identical.**~~ — **fixed.** They were byte-identical when both landed in `3a3c723`, but
+  the `from __future__ import annotations` fix from §1 was applied to `scripts/` only (in
+  `97cf7ab`). The `data/` copy never got it, so it **crashed on the `smplerx` env** —
+  `TypeError: 'type' object is not subscriptable`, the `list[int]` annotation evaluated at
+  def-time — while `scripts/` imports cleanly. That made the `data/` copy not merely
+  redundant but the broken one, and it was the copy sitting next to the data a newcomer
+  would reach for. The `data/` copy is now removed (the two differed only by those two
+  lines, and it is git-tracked, so it is recoverable); `scripts/` is canonical. Nothing
+  referenced the removed path.
+- ~~**`smplx_to_h5.py:303`** sets `trans_units = "metres"`, wrong for the lifted groups
+  (§2).~~ — **fixed**, and corrected rather than merely flagged, since §5 made the units
+  recoverable. The attribute is now the `TRANS_UNITS` constant in `smplx_to_h5.py`, naming
+  the virtual camera, its 5000 px focal, the `src/reproject.py` conversion, and the
+  model-origin-not-pelvis trap. Rewritten in place on the two lifted files already on disk
+  (`lifted_movi_smplx.h5`, `lifted_movi_part1_upd2.h5` — an attribute-only write, no array
+  touched). **The GT writers were deliberately left alone**: `scripts/movi_smplx_processing.py`
+  and `scripts/movi_raw_processing.py` also set `trans_units = "metres"`, and for AMASS GT
+  that is correct — GT trans is 0.94 m against the lifted 42–254.
 - **Re-rendering validation** still to do, now that there is a metric worth validating against.
 - ~~**`README.md`** is the vendored body_visualizer README, overwritten by mistake~~ —
   **fixed.** The vendored copy was moved to `body_visualizer/README.md` (it shipped no
@@ -723,6 +743,7 @@ python scripts/build_reproj_targets.py                        # -> data/reproj_t
 python -m pytest tests/test_reproject.py tests/test_rewards.py -o addopts=""
 
 # training with the GT-free reward (§6) — needs the smplerx env for smplx
+# the action is pose-only (156-d) by default; add --predict_trans for the ablation
 python -m src.train --h5_path data/processed_movi.h5 --reward_mode reproj \
     --reproj_path data/reproj_targets.h5 --reproj_sigma 0.04
 

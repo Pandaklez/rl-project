@@ -25,6 +25,7 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 
 import h5py
@@ -33,8 +34,43 @@ import torch
 
 from src.data.datasets import MoViDataset, gt_group
 from src.env import MoviEnv
-from src.models.policy import PoseActor, flatten_state, unflatten_action
+from src.models.policy import (ACTION_DIM_WITH_TRANS, PoseActor, flatten_state,
+                               unflatten_action)
 from src.smplx_fk import joints_from_poses
+
+
+# ─── Checkpoints ──────────────────────────────────────────────────────────────
+
+def load_checkpoint(path: str, device) -> dict:
+    """
+    Load a training checkpoint, with `config` normalised to a plain dict.
+
+    `src/train.py` now stores `asdict(cfg)`. Checkpoints written before that
+    pickled the `Config` dataclass itself, and because `python -m src.train` runs
+    that module as `__main__`, the pickle names the class `__main__.Config` — so
+    any other process loading it dies with
+
+        AttributeError: Can't get attribute 'Config' on <module '__main__'>
+
+    Re-exporting the class under `__main__` before the load is what lets those
+    older checkpoints still open. Unpickling only needs the name to resolve; the
+    dataclass it resolves to is the same one.
+    """
+    import __main__
+
+    if not hasattr(__main__, "Config"):
+        try:
+            from src.train import Config
+            __main__.Config = Config
+        except ImportError:      # training deps absent — fine unless the ckpt is old
+            pass
+
+    ckpt = torch.load(path, map_location=device)
+    cfg  = ckpt.get("config")
+    if cfg is not None and not isinstance(cfg, dict):
+        cfg = dataclasses.asdict(cfg) if dataclasses.is_dataclass(cfg) else vars(cfg)
+        ckpt["config"] = cfg
+    return ckpt
 
 
 # ─── Procrustes ───────────────────────────────────────────────────────────────
@@ -243,12 +279,19 @@ def main() -> None:
     # ── Model ─────────────────────────────────────────────────────────────────
     if args.checkpoint:
         device = torch.device(args.device)
-        ckpt   = torch.load(args.checkpoint, map_location=device)
+        ckpt   = load_checkpoint(args.checkpoint, device)
         cfg    = ckpt["config"]
 
-        actor = PoseActor(hidden_dims=cfg.hidden_dims, dropout=cfg.dropout).to(device)
+        # The action width is a property of the checkpoint, not of the current
+        # default: 156 for a pose-only policy, 159 for one that also corrected
+        # `trans`. Reading it back means checkpoints from either regime load.
+        act_dim  = ckpt["actor"]["log_std"].shape[0]
+        actor = PoseActor(hidden_dims=tuple(cfg["hidden_dims"]), dropout=cfg["dropout"],
+                          predict_trans=(act_dim == ACTION_DIM_WITH_TRANS)).to(device)
         actor.load_state_dict(ckpt["actor"])
-        print(f"\n── Model: {args.checkpoint} (update {ckpt['update']}) ──")
+        print(f"\n── Model: {args.checkpoint} ──")
+        print(f"  Action: {act_dim}-d "
+              f"({'poses + trans' if act_dim == ACTION_DIM_WITH_TRANS else 'poses only'})")
 
         dataset = MoViDataset(
             args.processed_h5, args.norm_stats_path,

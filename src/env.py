@@ -6,7 +6,8 @@ import torch.nn.functional as F
 import gymnasium
 from gymnasium import spaces
 
-from src.models.policy import flatten_state, unflatten_action, STATE_DIM, FRAME_DIM
+from src.models.policy import (STATE_DIM, action_dim, flatten_state,
+                               unflatten_action)
 
 
 def _to_tensor(x: torch.Tensor | np.ndarray, device: torch.device) -> torch.Tensor:
@@ -60,9 +61,14 @@ def compute_reward(
     w_similarity:   float = 1.0,
     w_smoothness:   float = 0.1,
     reward_scale:   float = 10.0,
+    keys:           tuple = ("poses", "trans"),
 ) -> float:
+    # `keys` drops to ("poses",) under pose-only training. Scoring `trans` there
+    # would add the lifted-vs-GT translation error to every reward — a constant
+    # the policy cannot affect, which leaves the gradient alone but shifts the
+    # value target by a large per-clip offset for no reason.
     reward = 0.0
-    for key in ("poses", "trans"):
+    for key in keys:
         # TODO: add Procrustes-Aligned instead of raw RMSE for similarity
         rmse    = (corrected[key] - gt[key]).pow(2).mean().sqrt()
         reward -= w_similarity * rmse.item()
@@ -104,11 +110,17 @@ class GymMoviEnv(gymnasium.Env):
         reproj_reward=None,
         w_reproj:     float = 1.0,
         baseline_every: int = 10,
+        predict_trans: bool = False,
     ):
         super().__init__()
         self.dataset      = dataset
         self.device       = torch.device(device)
         self.keys         = keys
+        # Pose-only by default (§2): the lifted `trans` is virtual-camera depth,
+        # not metres, so it is passed through rather than corrected. The state
+        # still carries it; only the action shrinks.
+        self.predict_trans = bool(predict_trans)
+        self.reward_keys   = keys if predict_trans else tuple(k for k in keys if k != "trans")
         self.w_similarity = w_similarity
         self.w_smoothness = w_smoothness
         self.reward_scale = reward_scale
@@ -131,7 +143,7 @@ class GymMoviEnv(gymnasium.Env):
             low=-np.inf, high=np.inf, shape=(STATE_DIM,), dtype=np.float32,
         )
         self.action_space = spaces.Box(
-            low=-np.inf, high=np.inf, shape=(FRAME_DIM,), dtype=np.float32,
+            low=-np.inf, high=np.inf, shape=(action_dim(self.predict_trans),), dtype=np.float32,
         )
 
         self._inner          = MoviEnv(device=device, keys=keys)
@@ -180,6 +192,7 @@ class GymMoviEnv(gymnasium.Env):
             reward = compute_reward(
                 corrected_t, gt_current, self._prev_corrected,
                 self.w_similarity, self.w_smoothness, self.reward_scale,
+                keys=self.reward_keys,
             )
             info = {}
 

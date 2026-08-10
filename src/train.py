@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -142,6 +142,12 @@ class Config:
     reproj_sigma: float = 0.04
     baseline_every: int = 10    # score the raw lifted frame every N steps (0 = off)
 
+    # Pose-only training (§2). The lifted `trans` is virtual-camera depth, not
+    # metres, so by default the policy corrects poses only and the translation
+    # is passed through. --predict_trans restores the old 159-d action as an
+    # ablation.
+    predict_trans: bool = False
+
     # Policy architecture
     hidden_dims: tuple = (512, 256)
     dropout:     float = 0.1
@@ -184,6 +190,10 @@ def train(cfg: Config) -> None:
         from src.rewards import ReprojectionReward, load_calib
         reproj_reward = ReprojectionReward(
             load_calib(cfg.h5_path), sigma=cfg.reproj_sigma,
+            # Under pose-only training the policy never moves `trans`, so there
+            # is nothing to re-derive: use the metric translation already in the
+            # sidecar, which is the path the 11.6 / 14.5 px validation measured.
+            correct_translation=cfg.predict_trans,
         )
         print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT")
     else:
@@ -199,7 +209,10 @@ def train(cfg: Config) -> None:
         reproj_reward=reproj_reward,
         w_reproj=cfg.w_reproj,
         baseline_every=cfg.baseline_every,
+        predict_trans=cfg.predict_trans,
     )
+    print(f"Action: {gym_env.action_space.shape[0]}-d "
+          f"({'poses + trans' if cfg.predict_trans else 'poses only, trans passed through'})")
     gym_env.reset(seed=cfg.seed)
     env = wrap_env(gym_env)
 
@@ -281,8 +294,12 @@ def train(cfg: Config) -> None:
     trainer.train()
 
     # ── Save actor in evaluate.py-compatible format ───────────────────────────
+    # The config goes in as a plain dict, not the dataclass. `python -m src.train`
+    # runs this module as `__main__`, so pickling `Config` itself records the class
+    # as `__main__.Config` and every reader that is not the training script fails
+    # with `AttributeError: Can't get attribute 'Config' on <module '__main__'>`.
     ckpt_path = Path(cfg.out_dir) / "actor_final.pt"
-    torch.save({"actor": actor.state_dict(), "config": cfg}, str(ckpt_path))
+    torch.save({"actor": actor.state_dict(), "config": asdict(cfg)}, str(ckpt_path))
     print(f"Actor weights saved → {ckpt_path}")
 
 
@@ -310,6 +327,10 @@ def main() -> None:
     parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
     parser.add_argument("--w_reproj",            type=float, default=1.0)
     parser.add_argument("--reproj_sigma",        type=float, default=0.04)
+    parser.add_argument("--predict_trans",       action="store_true",
+                        help="also correct the lifted translation (159-d action). "
+                             "Off by default: lifted trans is virtual-camera depth, "
+                             "not metres (§2), so the policy trains on pose alone.")
     parser.add_argument("--baseline_every",      type=int,   default=10,
                         help="score the raw lifted frame every N steps for comparison (0 disables)")
     parser.add_argument("--dropout",             type=float, default=0.1)
