@@ -1,4 +1,4 @@
-# Follow-up on Gustaf's handover notes
+# Follow-up on Gustaf's handover notes. (Written with Claude Code, so don't mind that it's a bit weird)
 
 Structured to follow his notes point by point. Each section states what was checked,
 the answer, and which script produces it.
