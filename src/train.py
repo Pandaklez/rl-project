@@ -276,6 +276,13 @@ def train(cfg: Config) -> None:
             # The image-plane figure needs the same 2D evidence the reward does,
             # so the val dataset is built with the targets attached.
             want_image = cfg.viz_mode == "image" and use_reproj
+            if cfg.viz_mode == "image" and not use_reproj:
+                # Silently dropping to the world-frame view would mean noticing
+                # hours later that the run has no image logging.
+                print("WARNING: --viz_mode image needs --reward_mode reproj "
+                      "(the figure reuses the reward's 2D targets). Falling back "
+                      "to the orthographic view; pass --viz_mode ortho to silence "
+                      "this.")
             viz_dataset = MoViDataset(
                 cfg.h5_path, cfg.norm_stats_path, split="val",
                 reproj_path=cfg.reproj_path if want_image else None,
@@ -298,7 +305,13 @@ def train(cfg: Config) -> None:
                 kind = "orthographic world frame"
             print(f"Pose viz: {kind}, every {cfg.viz_interval} updates")
         except Exception as e:                       # never let logging kill a run
-            print(f"Pose viz disabled: {type(e).__name__}: {e}")
+            # Loud on purpose. A run that quietly trains for eight hours with no
+            # pose figures is worse than one that fails at startup, because the
+            # figures are how the policy's behaviour is checked at all.
+            print("=" * 72)
+            print(f"WARNING: POSE VIZ DISABLED — {type(e).__name__}: {e}")
+            print("This run will log scalars but NO pose images.")
+            print("=" * 72)
 
     # TODO: train.py: Do we need to use PPO or PPO_RNN?
     agent = PPOWithPoseViz(

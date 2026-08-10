@@ -293,21 +293,41 @@ class ImagePoseVizLogger:
         rng = np.random.default_rng(seed)
         order = rng.permutation(len(dataset)).tolist()
         self.clips = []
+        rejected = {"no_targets": 0, "unaligned": 0, "no_video": 0}
         with h5py.File(reproj_path, "r") as rf:
             for idx in order:
                 if len(self.clips) >= n_clips:
                     break
                 clip, camera = dataset.samples[idx]
                 grp = rf.get(f"{dataset.split}/{clip}/{camera}")
-                if grp is None or not bool(grp.attrs.get("aligned", False)):
+                if grp is None:
+                    rejected["no_targets"] += 1
+                    continue
+                if not bool(grp.attrs.get("aligned", False)):
+                    rejected["unaligned"] += 1
                     continue
                 path = _video_path(video_root, camera, clip)
                 if path is None:
+                    rejected["no_video"] += 1
                     continue
                 self.clips.append({
                     "idx": idx, "clip": clip, "camera": camera, "video": path,
                     "start": int(grp.attrs["start"]), "t0": int(grp.attrs["t0"]),
                 })
+
+        # Refuse to construct rather than return None from every call. A logger
+        # with no clips produces no figures for the whole run and says nothing
+        # about why — the failure would only surface as an empty TensorBoard
+        # image tab hours later. Every cause here is a misconfiguration
+        # (wrong video_root, wrong reproj_path, wrong split) worth failing on.
+        if not self.clips:
+            raise RuntimeError(
+                f"ImagePoseVizLogger found no usable clips in split "
+                f"'{dataset.split}' among {len(order)} candidates "
+                f"(no targets: {rejected['no_targets']}, unaligned: "
+                f"{rejected['unaligned']}, no video file: {rejected['no_video']}). "
+                f"Checked videos under {video_root!r} and targets in "
+                f"{reproj_path!r}.")
 
     # ── projection ───────────────────────────────────────────────────────────
     def _project(self, poses_norm, betas, stats, camera, trans_metric):
