@@ -255,6 +255,12 @@ def train(cfg: Config) -> None:
     ppo_cfg["entropy_loss_scale"] = cfg.entropy_loss_scale
     ppo_cfg["value_loss_scale"]   = cfg.value_loss_scale
     ppo_cfg["grad_norm_clip"]     = cfg.grad_norm_clip
+    # Episodes end because the clip runs out of frames, which src/env.py reports
+    # as truncation. skrl only adds the bootstrap `gamma * V(s)` to the reward on
+    # truncated steps when this is on, and it defaults to False — without it the
+    # value target at every episode boundary is short by the entire remaining
+    # return (~60 here), which is what the first (B) attempt was training against.
+    ppo_cfg["time_limit_bootstrap"] = True
     ppo_cfg["experiment"]["directory"]           = cfg.out_dir
     ppo_cfg["experiment"]["write_interval"]      = cfg.log_interval
     ppo_cfg["experiment"]["checkpoint_interval"] = cfg.checkpoint_interval

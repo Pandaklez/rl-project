@@ -197,12 +197,23 @@ class GymMoviEnv(gymnasium.Env):
             info = {}
 
         self._t += 1
-        terminated = self._t >= self._T - 1
+        # Running out of frames is a *time limit*, not a terminal state. Nothing
+        # failed and no goal was reached — the clip simply has no frame t+1.
+        #
+        # Reporting it as `terminated` tells GAE that the value after the last
+        # step is zero. With ~500-frame episodes and a per-step reward near 0.7
+        # at discount 0.99, the true remaining return is ~60, so every episode
+        # boundary injected a value target off by that much. Reporting
+        # `truncated` instead lets skrl add the bootstrap (`ppo.py:299`,
+        # `rewards += discount_factor * values * truncated`) — which also
+        # requires `time_limit_bootstrap=True` in the PPO config, set in
+        # src/train.py.
+        truncated = self._t >= self._T - 1
         self._prev2_corrected = self._prev_corrected
         self._prev_corrected = {k: corrected_t[k].clone() for k in self.keys}
 
         obs = flatten_state(self._state).detach().cpu().numpy()
-        return obs, reward, terminated, False, info
+        return obs, reward, False, truncated, info
 
     def _reproj_step(self, corrected_t: dict) -> tuple[float, dict]:
         """Reprojection + smoothness, no ground truth involved."""
