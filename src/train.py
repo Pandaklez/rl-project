@@ -162,6 +162,11 @@ class Config:
     viz_interval:        int = 3     # log the 2D skeleton figure every N updates (0 = off)
     viz_clips:           int = 3     # held-out val clips shown per figure
     viz_frames:          int = 4     # frames sampled per clip
+    # "image" projects through the real camera and draws on the video frame the
+    # pose came from; "ortho" is the older world-frame stick figure, for runs
+    # with no reprojection targets.
+    viz_mode:            str = "image"
+    viz_video_root:      str = "demo/videos"
 
     # Misc
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -258,15 +263,34 @@ def train(cfg: Config) -> None:
     viz_logger = None
     if cfg.viz_interval > 0:
         try:
-            viz_dataset = MoViDataset(cfg.h5_path, cfg.norm_stats_path, split="val")
             import json
             with open(cfg.norm_stats_path) as f:
                 viz_stats = json.load(f)
-            viz_logger = PoseVizLogger(
-                viz_dataset, actor, viz_stats, device=cfg.device,
-                n_clips=cfg.viz_clips, n_frames=cfg.viz_frames, seed=cfg.seed,
+
+            # The image-plane figure needs the same 2D evidence the reward does,
+            # so the val dataset is built with the targets attached.
+            want_image = cfg.viz_mode == "image" and use_reproj
+            viz_dataset = MoViDataset(
+                cfg.h5_path, cfg.norm_stats_path, split="val",
+                reproj_path=cfg.reproj_path if want_image else None,
             )
-            print(f"Pose viz: {cfg.viz_clips} val clips every {cfg.viz_interval} updates")
+            if want_image:
+                from src.rewards import load_calib
+                from src.viz_pose import ImagePoseVizLogger
+                viz_logger = ImagePoseVizLogger(
+                    viz_dataset, actor, viz_stats, load_calib(cfg.h5_path),
+                    cfg.reproj_path, video_root=cfg.viz_video_root,
+                    device=cfg.device, n_clips=cfg.viz_clips,
+                    n_frames=cfg.viz_frames, seed=cfg.seed,
+                )
+                kind = f"image-plane on video ({len(viz_logger.clips)} clips)"
+            else:
+                viz_logger = PoseVizLogger(
+                    viz_dataset, actor, viz_stats, device=cfg.device,
+                    n_clips=cfg.viz_clips, n_frames=cfg.viz_frames, seed=cfg.seed,
+                )
+                kind = "orthographic world frame"
+            print(f"Pose viz: {kind}, every {cfg.viz_interval} updates")
         except Exception as e:                       # never let logging kill a run
             print(f"Pose viz disabled: {type(e).__name__}: {e}")
 
@@ -340,6 +364,11 @@ def main() -> None:
     parser.add_argument("--checkpoint_interval", type=int,   default=0)
     parser.add_argument("--viz_interval",        type=int,   default=3,
                         help="log the 2D skeleton overlay every N PPO updates (0 disables)")
+    parser.add_argument("--viz_mode",            choices=("image", "ortho"), default="image",
+                        help="'image' projects through the real camera onto the video "
+                             "frame (needs --reward_mode reproj); 'ortho' is the "
+                             "world-frame stick figure")
+    parser.add_argument("--viz_video_root",      default="demo/videos")
     parser.add_argument("--viz_clips",           type=int,   default=3)
     parser.add_argument("--viz_frames",          type=int,   default=4)
     parser.add_argument("--device",              default="cuda" if torch.cuda.is_available() else "cpu")

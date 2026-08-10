@@ -14,17 +14,30 @@ sampled frame. Every cell overlays three skeletons —
 If the blue skeleton sits on top of the red one, the policy is doing nothing.
 If it moves toward the green one, it is learning something useful.
 
-Projection: joints come from a real SMPL-X forward pass (src/smplx_fk.py), then
-are projected orthographically along the camera axis. True perspective
-reprojection needs metric translation, which is not recoverable until the
-per-frame bboxes are re-extracted (scripts/extract_2d.py). Orthographic is
-enough to see whether corrections are meaningful, and swapping in a real
-projection later does not change this file's interface.
+Two loggers, same interface (`__call__` -> Figure, `correction_magnitude` ->
+scalars), so `PPOWithPoseViz` does not care which it holds:
+
+`ImagePoseVizLogger` — **the real 2D one, and the default.** Skeletons are
+projected through the actual camera (real intrinsics + radial distortion, metric
+translation from `data/reproj_targets.h5`) and drawn *on the video frame the
+pose came from*, next to the ViTPose detections the reward scores against. This
+is the picture that answers "is the policy putting the body on the person".
+GT is deliberately not drawn here: §5 measured GT-through-calibration at 9.7 px
+on PG1 but 65-75 px on PG2 under every convention tried, so a GT skeleton in the
+image plane would be misleading on half the clips. The ViTPose keypoints are the
+honest 2D reference.
+
+`PoseVizLogger` — the original orthographic world-frame view (x-right, z-up),
+kept for runs without reprojection targets. No image, no camera, so it shows
+pose change but not image alignment.
 
 Clips and frame indices are fixed at construction, so successive figures are
-directly comparable across epochs.
+directly comparable across epochs. The rollout uses the policy *mean*, not a
+sample, so differences between figures are learning and not exploration noise.
 """
 from __future__ import annotations
+
+from pathlib import Path
 
 import matplotlib
 matplotlib.use("Agg")   # headless — must be set before pyplot
@@ -33,8 +46,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 
+from src.camera_frame import uncorrect_root
 from src.env import MoviEnv
 from src.models.policy import flatten_state, unflatten_action
+from src.reproject import COCO_IDX, place_in_camera, project
+from src.rewards import load_lifted_stats, unscale
 from src.smplx_fk import joints_from_poses
 
 # SMPL-X body joints 0-21
@@ -59,6 +75,12 @@ def unnormalize(arr: torch.Tensor, key: str, stats: dict) -> torch.Tensor:
     sigma = torch.as_tensor(np.array(stats[key]["sigma"]), dtype=torch.float32)
     sigma = torch.where(sigma == 0, torch.ones_like(sigma), sigma)
     return arr * sigma + mu
+
+
+def _unscale_seq(seq: torch.Tensor, stats) -> torch.Tensor:
+    """Unnormalise a (T, 52, 3) pose sequence with per-camera lifted stats."""
+    # The stats are stored per joint as (52, 3), which broadcasts over T as-is.
+    return torch.from_numpy(unscale(seq.numpy(), "poses", stats))
 
 
 def _draw(ax, joints2d, style):
@@ -113,9 +135,15 @@ class PoseVizLogger:
             lift.append(x["poses"][t].cpu())
             gt.append(y["poses"][t].cpu())
 
-        out = []
-        for seq in (lift, corr, gt):
-            out.append(unnormalize(torch.stack(seq), "poses", self.norm_stats))
+        # The lifted cameras and the GT are normalised with *different* stats
+        # (data/norm_upsample.py: normalization_lifted_pg{1,2}.json vs
+        # data/normalization.json). Unnormalising the policy's output with the
+        # GT stats produces a plausible-looking pose that is simply the wrong
+        # one — measured at 31 deg mean per-joint error, 86 deg worst.
+        lifted_stats = load_lifted_stats(sample["meta"]["camera"])
+        out = [_unscale_seq(torch.stack(lift), lifted_stats),
+               _unscale_seq(torch.stack(corr), lifted_stats),
+               unnormalize(torch.stack(gt), "poses", self.norm_stats)]
         return out
 
     @torch.no_grad()
@@ -198,6 +226,262 @@ class PoseVizLogger:
                 "pose/delta_from_lifted": float(np.mean(d_lift)),
                 "pose/err_corrected_vs_gt": float(np.mean(d_gt)),
                 "pose/err_lifted_vs_gt": float(np.mean(d_base)),
+            }
+        finally:
+            if was_training:
+                self.actor.train()
+
+
+# ─── Image-plane visualisation ────────────────────────────────────────────────
+
+# Confidence below this and a ViTPose keypoint is not drawn — matches the gate
+# the reward applies, so the figure shows the same evidence the reward scored.
+KP_MIN_CONFIDENCE = 0.3
+
+# Fraction of bbox size added around the crop, so limbs that leave the box are
+# still visible rather than clipped at the edge.
+CROP_MARGIN = 0.25
+
+IMAGE_STYLES = {                 # name -> (colour, linestyle, z-order)
+    "lifted":    ("#ff4d4d", "--", 2),
+    "corrected": ("#4da6ff", "-",  4),
+}
+
+
+def _video_path(video_root: Path, camera: str, clip: str) -> Path | None:
+    """`Subject_13__checking_watch` + `pg1` -> demo/videos/PG1_avi/F_PG1_Subject_13_L.avi"""
+    subject = clip.split("__")[0]                     # Subject_13
+    cam = camera.upper()                              # PG1
+    p = video_root / f"{cam}_avi" / f"F_{cam}_{subject}_L.avi"
+    return p if p.exists() else None
+
+
+class ImagePoseVizLogger:
+    """
+    Skeletons projected through the real camera, drawn on the video frame.
+
+    Each cell is one frame of one held-out validation clip:
+
+        the video frame itself, cropped to the subject
+        lifted    (red, dashed)   what SMPLer-X produced
+        corrected (blue)          what the policy produced
+        ViTPose   (green dots)    the 2D evidence the reward scores against
+
+    Blue sitting on red means the policy is doing nothing; blue moving onto the
+    green dots means it is improving the image fit. Because this is the same
+    projection path the reward uses (`uncorrect_root` -> FK -> `place_in_camera`
+    -> `project`), what you see is what is being optimised.
+    """
+
+    def __init__(self, dataset, actor, gt_stats, calib, reproj_path,
+                 video_root="demo/videos", device="cpu", n_clips=3, n_frames=4,
+                 max_steps=120, seed=0):
+        import h5py
+
+        self.dataset = dataset
+        self.actor = actor
+        self.gt_stats = gt_stats
+        self.calib = calib
+        self.device = torch.device(device)
+        self.n_frames = n_frames
+        self.max_steps = max_steps
+        video_root = Path(video_root)
+
+        # Pick clips once, at construction, so every figure shows the same ones.
+        # A clip qualifies only if it has aligned targets and a video on disk —
+        # the 20 unaligned cam-clips and Subject_6/pg1 (no video) are skipped.
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(dataset)).tolist()
+        self.clips = []
+        with h5py.File(reproj_path, "r") as rf:
+            for idx in order:
+                if len(self.clips) >= n_clips:
+                    break
+                clip, camera = dataset.samples[idx]
+                grp = rf.get(f"{dataset.split}/{clip}/{camera}")
+                if grp is None or not bool(grp.attrs.get("aligned", False)):
+                    continue
+                path = _video_path(video_root, camera, clip)
+                if path is None:
+                    continue
+                self.clips.append({
+                    "idx": idx, "clip": clip, "camera": camera, "video": path,
+                    "start": int(grp.attrs["start"]), "t0": int(grp.attrs["t0"]),
+                })
+
+    # ── projection ───────────────────────────────────────────────────────────
+    def _project(self, poses_norm, betas, stats, camera, trans_metric):
+        """One normalised frame -> (22, 2) image-plane joints."""
+        poses = unscale(poses_norm.reshape(52, 3), "poses", stats)
+        poses_cam = uncorrect_root(poses[None], camera)
+        joints = joints_from_poses(poses_cam, betas, device=str(self.device)).numpy()
+        placed = place_in_camera(joints, trans_metric[None])
+        return project(placed, self.calib[camera]["IntrinsicMatrix"],
+                       self.calib[camera]["RadialDistortion"])[0]
+
+    @torch.no_grad()
+    def _rollout(self, entry):
+        """Roll the policy out and return everything needed to draw one row."""
+        sample = self.dataset[entry["idx"]]
+        x, reproj = sample["x"], sample.get("reproj")
+        if reproj is None:
+            return None
+        valid = reproj["valid"].cpu().numpy().astype(bool)
+        T = sample["y"]["poses"].shape[0]
+        steps = min(self.max_steps, T) - 1
+        if steps < 1 or not valid[:steps].any():
+            return None
+
+        keys = ("poses", "trans")
+        env = MoviEnv(device=str(self.device))
+        state = env.reset({k: x[k][0] for k in keys})
+
+        corr = []
+        for t in range(steps):
+            flat = flatten_state(state).to(self.device)
+            action = self.actor.net(flat.unsqueeze(0)).squeeze(0).cpu()
+            state = env.step(unflatten_action(action), {k: x[k][t + 1] for k in keys})
+            corr.append(state["corrected_state"]["poses"].cpu().numpy())
+
+        # Sample frames evenly, but only from frames that carry 2D evidence —
+        # a panel with no detection would have nothing to compare against.
+        usable = np.flatnonzero(valid[:steps])
+        picks = usable[np.linspace(0, len(usable) - 1, self.n_frames).round().astype(int)]
+
+        stats = load_lifted_stats(entry["camera"])
+        betas = unscale(x["betas"].cpu().numpy(), "betas", stats)
+        kp2d = reproj["kp2d"].cpu().numpy()
+        bbox = reproj["bbox"].cpu().numpy()
+        tmet = reproj["trans_metric"].cpu().numpy()
+
+        # Pose index t (120 Hz GT timeline) -> target index j (native 30 Hz) ->
+        # video frame. This inverts the resampling norm_upsample.py applied.
+        panels = []
+        for t in picks:
+            j = int(round(t * (entry["t0"] - 1) / max(T - 1, 1)))
+            panels.append({
+                "t": int(t),
+                "frame": entry["start"] + j,
+                "bbox": bbox[t],
+                "kp2d": kp2d[t],
+                "lifted": self._project(x["poses"][t].cpu().numpy(), betas, stats,
+                                        entry["camera"], tmet[t]),
+                "corrected": self._project(corr[t], betas, stats,
+                                           entry["camera"], tmet[t]),
+            })
+        return panels
+
+    def _read_frames(self, entry, panels):
+        """Decode the needed video frames in one pass, ascending."""
+        import cv2
+
+        cap = cv2.VideoCapture(str(entry["video"]))
+        try:
+            for p in sorted(panels, key=lambda q: q["frame"]):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, p["frame"])
+                ok, img = cap.read()
+                p["image"] = cv2.cvtColor(img, cv2.COLOR_BGR2RGB) if ok else None
+        finally:
+            cap.release()
+
+    # ── figure ───────────────────────────────────────────────────────────────
+    @torch.no_grad()
+    def __call__(self):
+        was_training = self.actor.training
+        self.actor.eval()
+        try:
+            rows = []
+            for entry in self.clips:
+                panels = self._rollout(entry)
+                if panels:
+                    self._read_frames(entry, panels)
+                    rows.append((entry, panels))
+            if not rows:
+                return None
+
+            n_rows, n_cols = len(rows), self.n_frames
+            fig, axes = plt.subplots(n_rows, n_cols,
+                                     figsize=(3.0 * n_cols, 3.0 * n_rows), squeeze=False)
+
+            for r, (entry, panels) in enumerate(rows):
+                for c, p in enumerate(panels):
+                    ax = axes[r][c]
+                    x0, y0, w, h = p["bbox"]
+                    mx, my = CROP_MARGIN * w, CROP_MARGIN * h
+                    left, right = x0 - mx, x0 + w + mx
+                    top, bottom = y0 - my, y0 + h + my
+
+                    if p["image"] is not None:
+                        ax.imshow(p["image"])
+                        # Clamp to the frame, otherwise a bbox near an edge pads
+                        # the panel with blank canvas instead of picture.
+                        ih, iw = p["image"].shape[:2]
+                        left, right = max(left, 0), min(right, iw - 1)
+                        top, bottom = max(top, 0), min(bottom, ih - 1)
+                    else:
+                        ax.set_facecolor("#111111")
+
+                    for name in ("lifted", "corrected"):
+                        _draw(ax, p[name], IMAGE_STYLES[name])
+
+                    kp = p["kp2d"][COCO_IDX]
+                    vis = kp[:, 2] >= KP_MIN_CONFIDENCE
+                    ax.scatter(kp[vis, 0], kp[vis, 1], s=22, marker="o",
+                               facecolors="none", edgecolors="#2ca02c",
+                               linewidths=1.4, zorder=6)
+
+                    # Image coordinates: y grows downward, so the limits invert.
+                    ax.set_xlim(left, right)
+                    ax.set_ylim(bottom, top)
+                    ax.set_xticks([]); ax.set_yticks([])
+                    if r == 0:
+                        ax.set_title(f"frame {p['frame']}", fontsize=8)
+                    if c == 0:
+                        ax.set_ylabel(f"{entry['clip']}\n{entry['camera']}", fontsize=7)
+
+            handles = [plt.Line2D([], [], color=IMAGE_STYLES["lifted"][0],
+                                  linestyle="--", label="lifted"),
+                       plt.Line2D([], [], color=IMAGE_STYLES["corrected"][0],
+                                  linestyle="-", label="corrected"),
+                       plt.Line2D([], [], color="#2ca02c", linestyle="none",
+                                  marker="o", markerfacecolor="none", label="ViTPose 2D")]
+            fig.legend(handles=handles, loc="lower center", ncol=3,
+                       frameon=False, fontsize=9)
+            fig.tight_layout(rect=(0, 0.04, 1, 1))
+            return fig
+        finally:
+            if was_training:
+                self.actor.train()
+
+    @torch.no_grad()
+    def correction_magnitude(self):
+        """
+        Reprojection error in pixels, before and after the policy — the image-plane
+        counterpart of the orthographic logger's radian scalars.
+        """
+        was_training = self.actor.training
+        self.actor.eval()
+        try:
+            e_lift, e_corr = [], []
+            for entry in self.clips:
+                panels = self._rollout(entry)
+                if not panels:
+                    continue
+                for p in panels:
+                    kp = p["kp2d"][COCO_IDX]
+                    w = np.where(kp[:, 2] >= KP_MIN_CONFIDENCE, kp[:, 2], 0.0)
+                    if w.sum() <= 0:
+                        continue
+                    from src.reproject import SMPLX_IDX
+                    for name, acc in (("lifted", e_lift), ("corrected", e_corr)):
+                        d = np.linalg.norm(p[name][SMPLX_IDX] - kp[:, :2], axis=-1)
+                        acc.append(float(np.sum(w * d) / np.sum(w)))
+            if not e_lift:
+                return {}
+            return {
+                "pose/img_err_lifted_px": float(np.mean(e_lift)),
+                "pose/img_err_corrected_px": float(np.mean(e_corr)),
+                "pose/img_improvement_px": float(np.mean(e_lift) - np.mean(e_corr)),
             }
         finally:
             if was_training:
