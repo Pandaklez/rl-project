@@ -452,12 +452,20 @@ split is **median 4.5 m, range 2.5–6.1 m** — a mocap lab, not a 42 m virtual
    | raw + `cam_trans` (correct) | **11.6 px** | **14.5 px** |
    | pelvis at `cam_trans` | 83.4 px | 95.4 px |
 
-2. **Stay in the camera frame; the PG2 extrinsics are not good enough.** Projecting GT
-   through the calibration lands 9.7 px off for PG1 but **65–75 px for PG2 under every
-   rotation/translation convention tried** — so this is PG2 calibration accuracy, not a
-   convention error. It does not matter, because the whole reward path (lifted camera-frame
-   pose → FK → `place_in_camera` → `project`) needs only the intrinsics and the bbox. Both
-   cameras validate at 11.6 / 14.5 px that way, with no GT and no extrinsics involved.
+2. **Stay in the camera frame** — because the whole reward path (lifted camera-frame pose →
+   FK → `place_in_camera` → `project`) needs only the intrinsics and the bbox. Both cameras
+   validate at 11.6 / 14.5 px that way, with no GT and no extrinsics involved.
+
+   > **Retraction (2026-08-17).** This item previously claimed the PG2 extrinsics were not
+   > good enough — 9.7 px for PG1 but 65–75 px for PG2 "under every rotation/translation
+   > convention tried". That measurement was ad hoc and never committed, and it does not
+   > reproduce. `scripts/check_extrinsics.py` now measures it over 60 test clips
+   > (~440k joint observations per camera): with `X_cam = R_extᵀ · F · X_world + t`, `t` in
+   > millimetres, GT through the calibration lands at **12.0 px (PG1) / 14.5 px (PG2)** —
+   > no asymmetry, and PG2 through the extrinsics matches the camera-frame path exactly.
+   > `--sweep` shows every wrong convention costing 90–270 px on *both* cameras, which is
+   > the tell that a large per-camera gap was never a convention error. Staying in the
+   > camera frame is still the right call; it just is not because PG2 is miscalibrated.
 
 The 11.6 / 14.5 px figures are the honest end-to-end check: lifted poses projected against
 the ViTPose detections on the test split, on an 800×600 image.

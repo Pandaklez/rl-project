@@ -22,10 +22,11 @@ projected through the actual camera (real intrinsics + radial distortion, metric
 translation from `data/reproj_targets.h5`) and drawn *on the video frame the
 pose came from*, next to the ViTPose detections the reward scores against. This
 is the picture that answers "is the policy putting the body on the person".
-GT is deliberately not drawn here: §5 measured GT-through-calibration at 9.7 px
-on PG1 but 65-75 px on PG2 under every convention tried, so a GT skeleton in the
-image plane would be misleading on half the clips. The ViTPose keypoints are the
-honest 2D reference.
+GT is not drawn here. The original reason — that GT through the PG2 calibration
+was 65-75 px off — turned out to be wrong (`scripts/check_extrinsics.py` puts it
+at 12.0 px PG1 / 14.5 px PG2), so drawing GT is now a viable option rather than
+a misleading one. The ViTPose keypoints remain the reference the reward actually
+scores against, which is what this figure is for.
 
 `PoseVizLogger` — the original orthographic world-frame view (x-right, z-up),
 kept for runs without reprojection targets. No image, no camera, so it shows

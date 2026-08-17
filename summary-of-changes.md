@@ -70,8 +70,9 @@ its capacity undoing.
 
 - `src/viz_pose.py` `ImagePoseVizLogger` projects skeletons through the real camera
   and draws them **on the video frame**, beside the ViTPose detections — the same
-  path the reward uses. GT is not drawn: it is 65-75 px off on PG2 through the
-  calibration.
+  path the reward uses. GT is not drawn — originally because it was believed to be
+  65-75 px off on PG2 through the calibration, which `scripts/check_extrinsics.py`
+  has since disproved (12.0 px PG1 / 14.5 px PG2).
 - Fixed a bug where the figure unnormalised poses with **GT** stats rather than the
   per-camera lifted stats — 31° mean per-joint error.
 - TensorBoard: reward components, reprojection error in pixels, and

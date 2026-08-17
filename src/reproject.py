@@ -39,11 +39,18 @@ The effect is small but not negligible — ~4 px at the image corners.
 
 **Work in the camera frame.** The whole path — lifted camera-frame pose, FK,
 `place_in_camera`, `project` — needs only the intrinsics and the bbox, so a
-reward never touches the extrinsics. That is worth keeping: the PG2 extrinsics
-are measurably less accurate than PG1's. Projecting GT through them lands 65-75
-px off under every rotation/translation convention tried, against 9.7 px for
-PG1. Staying in the camera frame sidesteps this entirely, and the camera-frame
-path validates at 11.6 px (PG1) / 14.5 px (PG2) on the test split.
+reward never touches the extrinsics. That keeps the reward independent of a
+calibration it does not need, and the path validates at 11.6 px (PG1) /
+14.5 px (PG2) on the test split.
+
+An earlier version of this docstring justified that differently, claiming the
+PG2 extrinsics were measurably worse than PG1's — 65-75 px against 9.7 px.
+**That is false and has been retracted.** `scripts/check_extrinsics.py`
+re-measures it: with the correct convention (`X_cam = R_extᵀ · F · X_world + t`,
+`t` in millimetres) GT through the calibration lands at 12.0 px (PG1) /
+14.5 px (PG2) over 60 test clips — no asymmetry. A wrong convention costs
+90-270 px on *both* cameras, which is why a large per-camera gap was never a
+convention error to begin with.
 """
 from __future__ import annotations
 
