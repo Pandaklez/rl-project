@@ -55,7 +55,7 @@ def camera_to_world(camera: str, calib_dir: str | None = None) -> R:
     d = Path(calib_dir) if calib_dir else CALIB_DIR
     ext = np.load(d / f"Extrinsics_{camera.upper()}.npz")["rotationMatrix"]
     # .T for MATLAB's row-vector convention; .inv() to go camera -> world.
-    return R.from_matrix(WORLD_FLIP).inv() * R.from_matrix(ext.T).inv()
+    return R.from_matrix(WORLD_FLIP).inv() * R.from_matrix(ext)
 
 
 def correct_root(poses: np.ndarray, camera: str, calib_dir: str | None = None) -> np.ndarray:

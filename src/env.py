@@ -51,6 +51,44 @@ class MoviEnv:
             self.state["corrected_state"][k] = self.state["lifted_state"][k] + action[k].to(self.device)
             self.state["lifted_state"][k] = _to_tensor(next_lifted[k], self.device)
         return self.state
+    
+class NoTransMoviEnv:
+
+    def __init__(self, device: str = "cpu"):
+        self.device = torch.device(device)
+        
+
+    def reset(self, init_state: dict) -> dict:
+        """
+        Initialise episode from the first lifted frame.
+        init_state: dict of {key: tensor or ndarray}, one frame each.
+        Corrected state starts as zeros (no correction applied yet).
+        """
+        self.state = {
+            "lifted_state": _to_tensor(init_state["poses"], self.device),
+            "corrected_state": torch.zeros_like(_to_tensor(init_state["poses"], self.device)),
+        }
+
+        self._trans = _to_tensor(init_state["trans"], self.device)
+
+        return self.state
+
+    def step(self, action: dict, next_lifted: dict) -> dict:
+        """
+        Apply correction action and advance to the next lifted frame.
+
+        action       : {key: tensor}  — correction deltas, same shape as one frame
+        next_lifted  : {key: tensor}  — lifted frame at t+1
+
+        Returns the new state dict. Reward is computed externally in the training loop.
+        """
+
+        self.state["corrected_state"] = self.state["lifted_state"]["poses"] + action.to(self.device)
+        self.state["lifted_state"] = _to_tensor(next_lifted["poses"], self.device)
+
+        self._trans = _to_tensor(next_lifted["trans"], self.device)
+
+        return self.state
 
 
 # TODO: this metrics should be pulled from evaluate.py because we want the metrics to be the same
