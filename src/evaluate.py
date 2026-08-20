@@ -33,9 +33,8 @@ import numpy as np
 import torch
 
 from src.data.datasets import MoViDataset, gt_group
-from src.env import MoviEnv
-from src.models.policy import (ACTION_DIM_WITH_TRANS, PoseActor, flatten_state,
-                               unflatten_action)
+from src.env import rollout_policy
+from src.models.policy import PoseActor, trans_mode_from_width
 from src.smplx_fk import joints_from_poses
 
 
@@ -196,32 +195,38 @@ def eval_lifted_baseline(
 
 @torch.no_grad()
 def eval_model(
-    actor:      PoseActor,
-    dataset:    MoViDataset,
-    norm_stats: dict,
-    device:     torch.device,
+    actor:         PoseActor,
+    dataset:       MoViDataset,
+    norm_stats:    dict,
+    device:        torch.device,
+    reproj_reward = None,
+    use_evidence:  bool = False,
+    trans_mode:    str  = "none",
 ) -> dict:
+    """
+    PA-MPJPE of the corrected pose against GT.
+
+    `use_evidence` must match how the policy was trained — see
+    `src.env.rollout_policy`. A policy trained on the 362-d observation and
+    evaluated on the 318-d one does not raise; it silently scores badly, which
+    reads as a negative result rather than as the bug it is. `main` reads the
+    flag out of the checkpoint's config for exactly that reason.
+    """
     actor.eval()
-    env  = MoviEnv(device=str(device))
-    keys = ("poses", "trans")
 
     corrected_scores: list[float] = []
 
     for idx in range(len(dataset)):
         sample = dataset[idx]
-        x, y   = sample["x"], sample["y"]
-        T      = y["poses"].shape[0]
+        y      = sample["y"]
 
-        state = env.reset({k: x[k][0] for k in keys})
-        corr_frames: list[torch.Tensor] = []
-        gt_frames:   list[torch.Tensor] = []
-
-        for t in range(T - 1):
-            flat      = flatten_state(state).to(device)
-            action, _ = actor.act(flat)
-            state     = env.step(unflatten_action(action.cpu()), {k: x[k][t + 1] for k in keys})
-            corr_frames.append(state["corrected_state"]["poses"].cpu())
-            gt_frames.append(y["poses"][t].cpu())
+        corr_frames = rollout_policy(
+            sample, actor, device=str(device), reproj_reward=reproj_reward,
+            use_evidence=use_evidence, deterministic=True, trans_mode=trans_mode,
+        )
+        if not corr_frames:
+            continue
+        gt_frames = [y["poses"][t].cpu() for t in range(len(corr_frames))]
 
         corr_n = torch.stack(corr_frames)   # (T-1, J, 3), normalized
         gt_n   = torch.stack(gt_frames)     # (T-1, J, 3), normalized
@@ -286,20 +291,38 @@ def main() -> None:
         # default: 156 for a pose-only policy, 159 for one that also corrected
         # `trans`. Reading it back means checkpoints from either regime load.
         act_dim  = ckpt["actor"]["log_std"].shape[0]
-        actor = PoseActor(hidden_dims=tuple(cfg["hidden_dims"]), dropout=cfg["dropout"],
-                          predict_trans=(act_dim == ACTION_DIM_WITH_TRANS)).to(device)
+        trans_mode = trans_mode_from_width(act_dim)
+        # Likewise the observation width. A policy trained with the 2D evidence
+        # block cannot be rolled out without it, and the failure is silent — it
+        # just scores badly. The checkpoint records which it was.
+        use_evidence = bool(cfg.get("use_evidence", False)) and cfg.get("reward_mode") == "reproj"
+        actor = PoseActor(hidden_dims=tuple(cfg["hidden_dims"]),
+                          trans_mode=trans_mode,
+                          use_evidence=use_evidence).to(device)
         actor.load_state_dict(ckpt["actor"])
         print(f"\n── Model: {args.checkpoint} ──")
-        print(f"  Action: {act_dim}-d "
-              f"({'poses + trans' if act_dim == ACTION_DIM_WITH_TRANS else 'poses only'})")
+        print(f"  Action: {act_dim}-d (trans_mode={trans_mode})")
+        print(f"  Observation: {actor.net[0].in_features}-d "
+              f"({'pose + 2D evidence' if use_evidence else 'pose only'})")
 
         dataset = MoViDataset(
             args.processed_h5, args.norm_stats_path,
             split=args.split, verbose=True,
+            reproj_path=cfg.get("reproj_path") if use_evidence else None,
         )
         print(f"  Clips: {len(dataset)}")
 
-        res = eval_model(actor, dataset, norm_stats, device)
+        reproj_reward = None
+        if use_evidence:
+            from src.rewards import ReprojectionReward, load_calib
+            reproj_reward = ReprojectionReward(
+                load_calib(args.processed_h5), sigma=cfg.get("reproj_sigma", 0.04),
+                correct_translation=False,
+            )
+
+        res = eval_model(actor, dataset, norm_stats, device,
+                         reproj_reward=reproj_reward, use_evidence=use_evidence,
+                         trans_mode=trans_mode)
         all_results.update(res)
         print(f"  PA-MPJPE corrected     : {res['pa_mpjpe_corrected']:.5f}  ({res['n_clips_model']} clips)")
 

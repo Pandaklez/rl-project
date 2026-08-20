@@ -50,13 +50,46 @@ import numpy as np
 
 from src.camera_frame import uncorrect_root
 from src.reproject import (COCO_IDX, SMPLX_IDX, T_Z_MAX, metric_translation,
-                           place_in_camera, project)
+                           place_in_camera, project, real_intrinsics)
 
 REPO = Path(__file__).resolve().parent.parent
 
 # Depth below this is treated as the policy having pushed the body behind the
 # camera; the frame is scored as a miss rather than producing a wild projection.
 MIN_DEPTH_VIRTUAL = 0.5
+
+# Metric depth floor, in metres, for the reparameterised translation action. The
+# subjects are 3-6 m from the cameras, so anything under half a metre is the
+# policy having pushed the body into the lens.
+MIN_DEPTH_METRIC = 0.5
+
+# Number of COCO joints that survive the SMPL-X correspondence (see COCO17_TO_SMPLX).
+N_KP = len(COCO_IDX)
+
+# Per-joint 2D residuals go into the *observation*, so one badly detected frame
+# must not be allowed to dominate the running state normaliser. Half a bbox
+# height is already far outside anything a plausible pose produces — the
+# operating point is 0.028 — so clipping there loses no usable signal and bounds
+# the state.
+RESID_CLIP = 0.5
+
+# What a frame scores when the body is pushed behind the camera: no projection
+# exists, so there is no residual direction to report, only "this is very wrong".
+ERR_NORM_MISS = 2.0 * RESID_CLIP
+
+# Layout of the 2D-evidence block appended to the observation (§4 / fix 06).
+# Kept here rather than in models/policy.py because every number in it comes out
+# of this module, and a layout that lives apart from the code that fills it is a
+# layout that drifts.
+#
+#   [0:24)   resid    (12, 2)  projected - observed, in bbox-height units
+#   [24:36)  conf     (12,)    ViTPose confidence, zeroed below the threshold
+#   [36]     err_norm          the scalar the reward exponentiates
+#   [37]     valid             1.0 when the frame carried usable 2D evidence
+#   [38]     t_frac            t / (T-1), so the critic can see episode progress
+#   [39:44)  context           camera one-hot (2) + bbox bearing/size (3)
+CONTEXT_DIM  = 5
+EVIDENCE_DIM = N_KP * 2 + N_KP + 3 + CONTEXT_DIM        # 24 + 12 + 3 + 5 = 44
 
 
 @lru_cache(maxsize=4)
@@ -167,16 +200,26 @@ class ReprojectionReward:
         return True
 
     # ── per-frame reward ─────────────────────────────────────────────────────
-    def step(self, corrected: dict, t: int) -> tuple[float, dict]:
+    def step(self, corrected: dict, t: int, trans_delta=None) -> tuple[float, dict]:
         """
         corrected : {"poses": (52,3), "trans": (3,)} normalised, as the policy
                     emits them (world-frame root)
         t         : frame index into the clip
 
         returns (reward in (0, 1], info dict)
+
+        The info dict carries the **per-joint residual** alongside the scalar
+        error, because the observation needs it (§4: "the policy cannot see what
+        it is scored on"). It comes out of the same projection the reward is
+        computed from, so feeding the policy its own error costs nothing beyond
+        the forward pass already being paid for here.
+
+        `resid` is `(projected - observed) / bbox_height`, i.e. the per-joint
+        decomposition of exactly the quantity `err_norm` averages. Joints below
+        the confidence threshold are zeroed, matching their zero weight in the
+        reward.
         """
-        info = {"valid": False, "err_px": float("nan"), "err_norm": float("nan"),
-                "n_joints": 0}
+        info = empty_info()
         c = self._clip
         if c is None or t >= len(c["valid"]) or not c["valid"][t]:
             return float("nan"), info
@@ -184,16 +227,22 @@ class ReprojectionReward:
         obs = c["kp2d"][t][COCO_IDX]                    # (12, 3) x, y, confidence
         w = obs[:, 2].astype(np.float64)
         w = np.where(w >= self.min_confidence, w, 0.0)
+        info["conf"] = w.astype(np.float32)
         if w.sum() <= 0:
             return float("nan"), info
 
-        uv = self._project_frame(corrected, t)
+        uv = self._project_frame(corrected, t, trans_delta)
         if uv is None:
-            # body pushed behind the camera — a real miss, not a missing target
-            info["valid"] = True
+            # Body pushed behind the camera — a real miss, not a missing target.
+            # There is no projection, so there is no residual *direction* to
+            # report; the observation gets a zero vector and a saturated
+            # err_norm, which is a state the policy can tell apart from "fits
+            # perfectly" (zero residual, zero error).
+            info.update(valid=True, err_norm=ERR_NORM_MISS)
             return 0.0, info
 
-        d = np.linalg.norm(uv - obs[:, :2], axis=-1)
+        delta = uv - obs[:, :2]                         # (12, 2) signed, pixels
+        d = np.linalg.norm(delta, axis=-1)
         err_px = float(np.sum(w * d) / np.sum(w))
 
         # Scale-normalise so depth does not change how harshly a frame is judged.
@@ -201,16 +250,50 @@ class ReprojectionReward:
         err = err_px / scale
         reward = float(np.exp(-(err * err) / (self.sigma * self.sigma)))
 
+        resid = np.clip(delta / scale, -RESID_CLIP, RESID_CLIP)
+        resid = resid * (w[:, None] > 0)                # unscored joints read zero
         info.update(valid=True, err_px=err_px, err_norm=err,
-                    n_joints=int((w > 0).sum()))
+                    n_joints=int((w > 0).sum()),
+                    resid=resid.astype(np.float32))
         return reward, info
 
-    def _project_frame(self, corrected: dict, t: int):
+    def context(self, t: int) -> np.ndarray:
+        """
+        Camera identity and where in the image the subject sits, as 5 numbers.
+
+        The residual tells the policy *that* a joint is 8 px low. Turning that
+        into a joint-angle correction needs the projection Jacobian, which
+        depends on the camera and on where in the frame the body is — neither of
+        which is recoverable from 318 pose numbers. These are the cheapest
+        sufficient statistics for it.
+
+        Lengths are divided by the focal length rather than an image size, so the
+        units are bearing angles (radians, small-angle) and no image-dimension
+        constant has to be kept in sync with the calibration.
+        """
+        out = np.zeros(CONTEXT_DIM, dtype=np.float32)
+        c = self._clip
+        if c is None or t >= len(c["bbox"]):
+            return out
+        fx, fy, px, py = real_intrinsics(c["K"])
+        x, y, w, h = (float(v) for v in c["bbox"][t])
+        out[0 if str(c["camera"]).upper() == "PG1" else 1] = 1.0
+        out[2] = (x + 0.5 * w - px) / fx
+        out[3] = (y + 0.5 * h - py) / fy
+        out[4] = h / fy
+        return out
+
+    def _project_frame(self, corrected: dict, t: int, trans_delta=None):
         """Corrected normalised frame -> (12, 2) projected keypoints, or None."""
         from src.smplx_fk import joints_from_poses
 
         c = self._clip
         poses = unscale(_np(corrected["poses"]).reshape(52, 3), "poses", c["stats"])
+        # A diverged policy reaches here with inf or nan and `Rotation.from_rotvec`
+        # raises "Found zero norm quaternions", killing the run hours in. Report
+        # it as a miss and let the caller end the episode instead.
+        if not np.isfinite(poses).all():
+            return None
         poses_cam = uncorrect_root(poses[None], c["camera"])           # (1, 52, 3)
 
         if self.correct_translation:
@@ -225,13 +308,112 @@ class ReprojectionReward:
             if not ok[0]:
                 return None
         else:
-            trans_metric = c["trans_metric"][t][None]
+            trans_metric = np.array(c["trans_metric"][t][None], dtype=np.float64)
+
+        trans_metric = self._apply_trans_delta(trans_metric, trans_delta, t)
+        if trans_metric is None:
+            return None
 
         joints = joints_from_poses(poses_cam, c["betas"], gender=self.gender,
                                    device=self.device).numpy()          # (1, 22, 3)
         placed = place_in_camera(joints, trans_metric)
         uv = project(placed, c["K"], c["radial"])                       # (1, 22, 2)
         return uv[0][SMPLX_IDX]
+
+    def _apply_trans_delta(self, trans_metric: np.ndarray, trans_delta, t: int):
+        """
+        Apply `(du, dv, dlog_tz)` to a metric translation. Returns None if the
+        result puts the body implausibly close to the camera.
+
+        The point of this parameterisation is that the two components are
+        *separated by how much the reward can see them*:
+
+        * `dlog_tz` scales the whole translation, so the body slides along its
+          own viewing ray: `u, v` are unchanged to first order and only apparent
+          size moves. This is the direction reprojection is nearly blind in.
+        * `du, dv` then shift the body in the image plane. At depth Z a shift of
+          one bbox height `h` on the sensor is `h·Z/f` metres, so the conversion
+          is exact for the pinhole term — the residual the policy observes and
+          the correction it writes are in the same units, one for one.
+
+        Order matters: depth first, then the image shift computed at the new
+        depth, so the two are independent rather than the shift being scaled by
+        a depth change the policy did not intend.
+        """
+        if trans_delta is None:
+            return trans_metric
+        du, dv, dlog = (float(v) for v in np.asarray(trans_delta).reshape(3))
+        if du == 0.0 and dv == 0.0 and dlog == 0.0:
+            return trans_metric
+        if not np.isfinite([du, dv, dlog]).all():
+            return None
+
+        out = np.array(trans_metric, dtype=np.float64, copy=True)
+        if dlog:
+            out *= float(np.exp(dlog))
+        z = float(out[0, 2])
+        if not z > MIN_DEPTH_METRIC:
+            return None
+
+        c = self._clip
+        fx, fy, _, _ = real_intrinsics(c["K"])
+        h = float(c["bbox"][t][3]) or 1.0
+        out[0, 0] += du * h * z / fx
+        out[0, 1] += dv * h * z / fy
+        return out
+
+
+def empty_info() -> dict:
+    """
+    The info dict for a frame with no usable 2D evidence.
+
+    One definition, used by `ReprojectionReward.step` and by callers that have no
+    reward bound at all, so "no measurement" is the same shape everywhere and
+    `pack_evidence` needs no special case.
+    """
+    return {"valid": False, "err_px": float("nan"), "err_norm": float("nan"),
+            "n_joints": 0,
+            "resid": np.zeros((N_KP, 2), dtype=np.float32),
+            "conf": np.zeros(N_KP, dtype=np.float32)}
+
+
+def pack_evidence(info: dict, context: np.ndarray, t_frac: float) -> np.ndarray:
+    """
+    Assemble the EVIDENCE_DIM block the policy observes, from one `step()` info
+    dict plus the clip context.
+
+    This is the whole of fix 06. The observation gains the residual the reward is
+    computed from, so the mapping the policy has to learn goes from
+    "reduce a 2D error you cannot measure" to "your left knee projects 0.06 bbox
+    heights low, move it" — which is close to invertible.
+
+    Note what is *not* here: ground truth. Every number is derived from the
+    lifted pose, the ViTPose detections and the calibration, all of which are
+    inputs at inference time. The GT-free property of experiment (B) is intact.
+    """
+    err_norm = info.get("err_norm", float("nan"))
+    if err_norm != err_norm:                       # nan -> no measurement
+        err_norm = 0.0
+    return np.concatenate([
+        np.asarray(info["resid"], dtype=np.float32).reshape(-1),
+        np.asarray(info["conf"], dtype=np.float32).reshape(-1),
+        np.array([float(err_norm),
+                  1.0 if info.get("valid") else 0.0,
+                  float(t_frac)], dtype=np.float32),
+        np.asarray(context, dtype=np.float32).reshape(-1),
+    ]).astype(np.float32)
+
+
+def empty_evidence(t_frac: float = 0.0) -> np.ndarray:
+    """
+    The evidence block for a frame with no 2D targets at all: no residual, no
+    confidence, `valid = 0`.
+
+    Used by the clips carrying no usable sidecar (20 of 3532 cam-clips) and by
+    rollout paths that run without a reward attached. Episode progress is still
+    filled in, because that is known regardless of whether the detector fired.
+    """
+    return pack_evidence(empty_info(), np.zeros(CONTEXT_DIM, dtype=np.float32), t_frac)
 
 
 def smoothness_reward(corrected: np.ndarray, prev: np.ndarray, prev2: np.ndarray,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 from torch.distributions import Normal
@@ -11,6 +13,35 @@ TRANS_DIM = 3
 BETAS_DIM = 16
 FRAME_DIM = POSE_DIM + TRANS_DIM        # 159 — one frame of poses + trans
 STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1}
+
+# Width of the 2D-evidence block (src/rewards.py owns the layout). Imported by
+# value rather than re-derived so the two cannot drift apart.
+from src.rewards import EVIDENCE_DIM     # noqa: E402  (44)
+
+
+def state_dim(use_evidence: bool = False, use_betas: bool = False) -> int:
+    """
+    Observation width.
+
+    Without evidence this is the historical 318: the lifted frame and the
+    previous corrected frame, and nothing about the image the reward scores
+    against. With it, 362 — see `src/rewards.pack_evidence` for why that is the
+    difference between a policy that can learn and one whose optimum is the
+    identity.
+    """
+    return STATE_DIM + (EVIDENCE_DIM if use_evidence else 0) + (BETAS_DIM if use_betas else 0)
+
+
+# Bound on one correction delta, in normalised pose units (fix 03).
+#
+# The action is a residual around an already-good pose: the policy starts at
+# sigma = 0.05 (INIT_LOG_STD below), so 0.3 is 6 sigma and further than any
+# plausible correction — a joint moved 0.3 normalised units is moved a third of
+# the dataset's spread for that joint. It is a guard rail, not a constraint that
+# should ever bind during healthy training; if it binds, the run is diverging,
+# which is exactly the case where an unbounded Box let 4.1M steps of random walk
+# run off to a NaN pose instead of being caught.
+ACTION_LIMIT = 0.3
 
 # Action layout. The *state* always carries both poses and trans; only the
 # action shrinks.
@@ -26,30 +57,126 @@ STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1
 # Pose-only is therefore the default: 156 dims, no trans delta. `trans` stays in
 # the observation, because apparent size in the image is genuine information
 # about depth even when the number is not metric.
-ACTION_DIM_POSE_ONLY = POSE_DIM         # 156 — poses only (default)
-ACTION_DIM_WITH_TRANS = FRAME_DIM       # 159 — poses + trans (ablation)
+ACTION_DIM_POSE_ONLY  = POSE_DIM        # 156 — poses only (default)
+ACTION_DIM_UV         = POSE_DIM + 2    # 158 — poses + image-plane shift
+ACTION_DIM_WITH_TRANS = POSE_DIM + 3    # 159 — poses + shift + log-depth
+
+# ── Translation action: reparameterised into what the reward can actually see ─
+#
+# The old 159-d action added a delta to the lifted `trans`, i.e. to SMPLer-X's
+# cam_trans in a cropped-bbox virtual camera with a 5000 px focal. Three
+# problems, all fatal: the units are not metres, the mapping to the image is not
+# a translation, and the depth component is the direction the reprojection
+# reward is *blind* in. Letting the policy move it is letting it random-walk in
+# an unobservable direction — which is exactly the failure §5 predicts, since GT
+# scores no better than the lifted pose on 2D evidence precisely because the
+# residual error lives in depth.
+#
+# The reparameterisation splits the translation into the coordinates the reward
+# is sensitive in, and freezes the one it is not:
+#
+#   du, dv     image-plane shift in bbox-height units. Moves the projection
+#              one-for-one, and is exactly what the mean of the observed
+#              residual reports — so the policy reads the residual and writes
+#              back its negation. Near-invertible.
+#   dlog_tz    log-depth, applied along the viewing ray so u, v are unchanged
+#              and only apparent size moves. Reprojection barely responds to it.
+#
+# `trans_mode="uv"` omits dlog_tz from the action *by width*, so depth drift is
+# structurally impossible rather than merely discouraged by a reward term.
+# `trans_mode="uvz"` unfreezes it: one extra scalar, a clean ablation with an
+# obvious hypothesis — if depth is unobservable, unfreezing it should degrade
+# 3D accuracy while barely moving the 2D reward.
+TRANS_MODE_NONE = "none"
+TRANS_MODE_UV   = "uv"
+TRANS_MODE_UVZ  = "uvz"
+TRANS_MODES     = (TRANS_MODE_NONE, TRANS_MODE_UV, TRANS_MODE_UVZ)
+
+_TRANS_WIDTH = {
+    TRANS_MODE_NONE: ACTION_DIM_POSE_ONLY,
+    TRANS_MODE_UV:   ACTION_DIM_UV,
+    TRANS_MODE_UVZ:  ACTION_DIM_WITH_TRANS,
+}
+_WIDTH_TRANS = {v: k for k, v in _TRANS_WIDTH.items()}
+
+# Bound on the image-plane shift, in bbox-height units. The measured operating
+# point of the reprojection error is 0.028, so 0.1 is ~3.5x any offset a sane
+# correction needs — generous, and still finite.
+TRANS_UV_LIMIT = 0.1
+# Bound on dlog_tz: +-10% in depth. Only reachable in the "uvz" ablation.
+TRANS_LOGZ_LIMIT = 0.1
 
 
-def action_dim(predict_trans: bool = False) -> int:
+def action_dim(trans_mode: str = TRANS_MODE_NONE) -> int:
     """Width of the policy's action vector."""
-    return ACTION_DIM_WITH_TRANS if predict_trans else ACTION_DIM_POSE_ONLY
+    if isinstance(trans_mode, bool):        # legacy predict_trans=True/False
+        trans_mode = TRANS_MODE_UVZ if trans_mode else TRANS_MODE_NONE
+    if trans_mode not in _TRANS_WIDTH:
+        raise ValueError(f"trans_mode must be one of {TRANS_MODES}, got {trans_mode!r}")
+    return _TRANS_WIDTH[trans_mode]
 
 
-def _mlp(
-    dims: list[int],
-    activation: type[nn.Module] = nn.ELU,
-    dropout: float = 0.0,
-) -> nn.Sequential:
+def trans_mode_from_width(width: int) -> str:
+    """Which translation parameterisation an action of this width carries."""
+    try:
+        return _WIDTH_TRANS[int(width)]
+    except KeyError:
+        raise ValueError(
+            f"action width {width} is none of {ACTION_DIM_POSE_ONLY} (poses only), "
+            f"{ACTION_DIM_UV} (poses + du,dv) or {ACTION_DIM_WITH_TRANS} "
+            f"(poses + du,dv,dlog_tz)") from None
+
+
+def action_bounds(trans_mode: str = TRANS_MODE_NONE):
+    """
+    Per-dimension (low, high) for the action space.
+
+    The pose dims and the translation dims are on different scales and get
+    different bounds — a single box would either let the image shift run to 0.3
+    bbox heights (a tenth of the frame) or squeeze the pose delta to 0.1.
+    """
+    import numpy as np
+
+    width = action_dim(trans_mode)
+    low = np.full(width, -ACTION_LIMIT, dtype=np.float32)
+    high = np.full(width, ACTION_LIMIT, dtype=np.float32)
+    if width > POSE_DIM:
+        low[POSE_DIM:POSE_DIM + 2] = -TRANS_UV_LIMIT
+        high[POSE_DIM:POSE_DIM + 2] = TRANS_UV_LIMIT
+    if width > POSE_DIM + 2:
+        low[POSE_DIM + 2] = -TRANS_LOGZ_LIMIT
+        high[POSE_DIM + 2] = TRANS_LOGZ_LIMIT
+    return low, high
+
+
+def _mlp(dims: list[int], activation: type[nn.Module] = nn.ELU) -> nn.Sequential:
+    """
+    Plain MLP. **There is deliberately no dropout option** (fix 01).
+
+    Dropout here was the cause of the (B) divergence. skrl runs the rollout under
+    `set_mode("eval")` and the update under `set_mode("train")`
+    (`skrl/agents/torch/ppo/ppo.py:202,344`), so `log_prob_old` was recorded from
+    a clean network and `log_prob_new` recomputed from a perturbed one. The
+    importance ratio then measured dropout noise rather than a policy change:
+    median ratio 0.48, and 88.9% of transitions clipped on the very first update,
+    before any learning had happened. The measured mean/std of the log-ratio
+    matched `N(-|dmu|^2/2s^2, |dmu|^2/s^2)` exactly, and both terms shrink with
+    sigma, so PPO's clip penalty also drove sigma upward until the policy
+    produced a NaN pose at 2.77M steps.
+
+    Independent of the skrl mode switch, dropout in a policy network is simply
+    wrong: it makes the behaviour policy stochastic in a way the stored log-prob
+    does not model. Removing the parameter rather than defaulting it to 0 is the
+    point — a default can be passed over.
+    """
     layers: list[nn.Module] = []
     for i in range(len(dims) - 2):
         layers += [nn.Linear(dims[i], dims[i + 1]), activation()]
-        if dropout > 0.0:
-            layers.append(nn.Dropout(p=dropout))
     layers.append(nn.Linear(dims[-2], dims[-1]))
     return nn.Sequential(*layers)
 
 
-def flatten_state(state: dict, use_betas: bool = False) -> torch.Tensor:
+def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.Tensor:
     """
     Convert the env state dict to a flat tensor suitable for the policy.
 
@@ -59,7 +186,16 @@ def flatten_state(state: dict, use_betas: bool = False) -> torch.Tensor:
         state["corrected_state"]["poses"] (..., 52, 3)
         state["corrected_state"]["trans"] (..., 3)
 
-    Returns tensor of shape (..., STATE_DIM) or (..., STATE_DIM + BETAS_DIM).
+    `evidence` is the EVIDENCE_DIM block from `src.rewards.pack_evidence`: the
+    2D residual the reward is computed from, plus the context needed to act on
+    it. Passing it is what makes the reward observable at all — see fix 06.
+
+    **Every rollout path must agree on this.** Training, `src/viz_pose.py` and
+    `src/evaluate.py` all build observations through this function, and a policy
+    fed 318 numbers when it was trained on 362 does not fail loudly, it just
+    produces nonsense. `state_dim()` is the single source of truth for the width.
+
+    Returns a tensor of shape (..., state_dim(...)).
     """
     lifted    = state["lifted_state"]
     corrected = state["corrected_state"]
@@ -71,42 +207,51 @@ def flatten_state(state: dict, use_betas: bool = False) -> torch.Tensor:
     ]
     if use_betas:
         parts.append(lifted["betas"])      # (..., 16)
+    if evidence is not None:
+        if not isinstance(evidence, torch.Tensor):
+            evidence = torch.as_tensor(evidence, dtype=torch.float32)
+        ref = parts[0]
+        parts.append(evidence.to(device=ref.device, dtype=ref.dtype)
+                     .reshape(*ref.shape[:-1], EVIDENCE_DIM))
     return torch.cat(parts, dim=-1)
 
 
 def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
     """
-    Split a flat action vector back into the dict format expected by MoviEnv.step().
+    Split a flat action vector into the parts `MoviEnv.step` consumes.
 
-    Both action widths are accepted, and which one it is follows from the width
-    itself rather than from a flag the caller has to keep in sync:
+    Which layout it is follows from the width itself rather than from a flag the
+    caller has to keep in sync:
 
-        (..., 156)  poses only     -> trans delta is exactly zero
-        (..., 159)  poses + trans  -> trans delta comes from the action
+        (..., 156)  poses only            -> trans_delta is exactly zero
+        (..., 158)  poses + du, dv        -> dlog_tz is exactly zero (frozen)
+        (..., 159)  poses + du, dv, dlog  -> all three free (ablation)
 
-    The zero trans delta is what makes pose-only training work without touching
-    `MoviEnv.step`: `corrected = lifted + 0` passes the lifted translation
-    through untouched, so downstream FK and projection still get a translation,
-    it is simply not one the policy chose.
+    Returns `{"poses": (..., 52, 3), "trans_delta": (..., 3)}`.
 
-    Reading the width also means a checkpoint trained either way loads and rolls
-    out correctly in `evaluate.py` / `viz_pose.py` without a flag at the call
-    site — the tensor says which it is.
+    `trans_delta` is **not** a delta on the lifted `trans`. It is
+    `(du, dv, dlog_tz)`: an image-plane shift in bbox-height units and a
+    log-depth change along the viewing ray, applied to the *metric* translation
+    at projection time (`src/rewards.py::_project_frame`). The lifted `trans`
+    itself is always passed through untouched, so nothing downstream has to know
+    which mode is in force.
+
+    Zero-padding the frozen dimensions rather than branching means the reward
+    path sees the same 3-vector shape in every mode, and "frozen" is expressed
+    as a structural zero that no gradient can reach — the policy has no
+    parameter for it at all.
     """
     width = action.shape[-1]
-    if width == ACTION_DIM_WITH_TRANS:
-        poses_flat = action[..., :POSE_DIM]
-        trans      = action[..., POSE_DIM:]
-    elif width == ACTION_DIM_POSE_ONLY:
-        poses_flat = action
-        trans      = action.new_zeros((*action.shape[:-1], TRANS_DIM))
-    else:
-        raise ValueError(
-            f"action width {width} is neither {ACTION_DIM_POSE_ONLY} (poses only) "
-            f"nor {ACTION_DIM_WITH_TRANS} (poses + trans)")
+    mode = trans_mode_from_width(width)
+    poses_flat = action[..., :POSE_DIM]
+    n_free = width - POSE_DIM
+    trans_delta = action.new_zeros((*action.shape[:-1], 3))
+    if n_free:
+        trans_delta[..., :n_free] = action[..., POSE_DIM:]
     return {
         "poses": poses_flat.unflatten(-1, (N_JOINTS, 3)),
-        "trans": trans,
+        "trans_delta": trans_delta,
+        "trans_mode": mode,
     }
 
 
@@ -132,6 +277,47 @@ def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
 # ceiling.
 INIT_LOG_STD = -3.0
 
+# ...and the same number is *wrong* for the translation dimensions, because they
+# are not in pose units.
+#
+# `du`/`dv` are in bbox-height units, where the reward's whole operating point is
+# err = 0.028 and its sigma is 0.04. Initialising them at 0.05 as well makes the
+# mean sampled shift `0.05·sqrt(2/pi)` = 0.040 bbox heights — 18.4 px on a 464 px
+# bbox, larger than the 13 px error the policy is being asked to remove.
+#
+# Measured, in a run that shipped with the shared value: `du |abs|` settled at
+# 0.0398 and `dv |abs|` at 0.0434 against a predicted 0.0397, i.e. the
+# translation action was pure sampling noise and nothing had been learned; the
+# corrected error sat at 32.9 px against a lifted 13.9 px, the difference being
+# exactly the injected noise. The held-out figure, which uses the policy *mean*
+# and so carries no sampling noise, was simultaneously the best of any run —
+# which is what says the mechanism is sound and only its scale was wrong.
+#
+# 0.005 bbox heights is ~2.3 px: small against the 13 px operating point, and
+# still two orders of magnitude above float noise, so there is a gradient.
+INIT_LOG_STD_TRANS = -5.3           # log(0.005)
+
+
+def init_log_std_vector(trans_mode: str = TRANS_MODE_NONE,
+                        pose_value: float = INIT_LOG_STD,
+                        trans_value: float = INIT_LOG_STD_TRANS):
+    """
+    Per-dimension initial log-sigma.
+
+    A single scalar cannot be right for both halves of this action: the pose
+    dims and the translation dims are in different units, and the sigma that is
+    a small perturbation in one is a destructive one in the other. Same reason
+    `action_bounds` is per-dimension.
+
+    PPO learns `log_std` from here, so these are starting points, not ceilings.
+    """
+    import torch as _torch
+
+    width = action_dim(trans_mode)
+    v = _torch.full((width,), float(pose_value))
+    v[POSE_DIM:] = float(trans_value)
+    return v
+
 
 # ─── Legacy models (used by src/evaluate.py) ──────────────────────────────────
 
@@ -147,15 +333,15 @@ class PoseActor(nn.Module):
         self,
         use_betas:   bool          = False,
         hidden_dims: tuple[int, ...] = (512, 256),
-        dropout:     float         = 0.0,
         init_log_std: float        = INIT_LOG_STD,
-        predict_trans: bool        = False,
+        trans_mode:  str           = TRANS_MODE_NONE,
+        use_evidence: bool         = False,
     ):
         super().__init__()
-        state_dim    = STATE_DIM + (BETAS_DIM if use_betas else 0)
-        act_dim      = action_dim(predict_trans)
-        self.net     = _mlp([state_dim, *hidden_dims, act_dim], dropout=dropout)
-        self.log_std = nn.Parameter(torch.full((act_dim,), float(init_log_std)))
+        obs_dim      = state_dim(use_evidence=use_evidence, use_betas=use_betas)
+        act_dim      = action_dim(trans_mode)
+        self.net     = _mlp([obs_dim, *hidden_dims, act_dim])
+        self.log_std = nn.Parameter(init_log_std_vector(trans_mode, init_log_std))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -191,11 +377,11 @@ class PoseCritic(nn.Module):
         self,
         use_betas:   bool          = False,
         hidden_dims: tuple[int, ...] = (512, 256),
-        dropout:     float         = 0.0,
+        use_evidence: bool         = False,
     ):
         super().__init__()
-        state_dim = STATE_DIM + (BETAS_DIM if use_betas else 0)
-        self.net  = _mlp([state_dim, *hidden_dims, 1], dropout=dropout)
+        obs_dim  = state_dim(use_evidence=use_evidence, use_betas=use_betas)
+        self.net = _mlp([obs_dim, *hidden_dims, 1])
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -227,20 +413,31 @@ class SkrlPoseActor(GaussianMixin, Model):
         action_space,
         device,
         hidden_dims: tuple[int, ...] = (512, 256),
-        dropout:     float           = 0.0,
         init_log_std: float          = INIT_LOG_STD,
     ):
         Model.__init__(self, observation_space, action_space, device)
         GaussianMixin.__init__(
             self,
-            clip_actions=False,
+            # Fix 03. With a finite action_space this clips the sampled delta to
+            # +-ACTION_LIMIT. The log-prob is still the unclipped Gaussian's,
+            # which is the standard clipped-Gaussian treatment and is fine here
+            # because at sigma = 0.05 the bound is 6 sigma away and effectively
+            # never binds — it exists to stop a diverging run, not to shape a
+            # healthy one.
+            clip_actions=True,
             clip_log_std=True,
             min_log_std=-20.0,
-            max_log_std=2.0,
+            # Was 2.0, i.e. sigma up to 7.4 in normalised pose units, which is
+            # not a policy so much as noise. Tied to ACTION_LIMIT instead: once
+            # sigma reaches the clip bound the distribution is wider than the
+            # range it is allowed to act in, so nothing above that is a policy.
+            # The diverging run reached 0.118 and was still climbing.
+            max_log_std=math.log(ACTION_LIMIT),
             reduction="sum",
         )
-        self.net     = _mlp([self.num_observations, *hidden_dims, self.num_actions], dropout=dropout)
-        self.log_std = nn.Parameter(torch.full((self.num_actions,), float(init_log_std)))
+        self.net     = _mlp([self.num_observations, *hidden_dims, self.num_actions])
+        self.log_std = nn.Parameter(
+            init_log_std_vector(trans_mode_from_width(self.num_actions), init_log_std))
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -264,11 +461,10 @@ class SkrlPoseCritic(DeterministicMixin, Model):
         action_space,
         device,
         hidden_dims: tuple[int, ...] = (512, 256),
-        dropout:     float           = 0.0,
     ):
         Model.__init__(self, observation_space, action_space, device)
         DeterministicMixin.__init__(self, clip_actions=False)
-        self.net = _mlp([self.num_observations, *hidden_dims, 1], dropout=dropout)
+        self.net = _mlp([self.num_observations, *hidden_dims, 1])
         self._init_weights()
 
     def _init_weights(self) -> None:

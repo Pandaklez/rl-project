@@ -48,8 +48,7 @@ import numpy as np
 import torch
 
 from src.camera_frame import uncorrect_root
-from src.env import MoviEnv
-from src.models.policy import flatten_state, unflatten_action
+from src.env import rollout_policy
 from src.reproject import COCO_IDX, place_in_camera, project
 from src.rewards import load_lifted_stats, unscale
 from src.smplx_fk import joints_from_poses
@@ -123,18 +122,10 @@ class PoseVizLogger:
         if steps < 1:
             return None
 
-        env = MoviEnv(device=str(self.device))
-        state = env.reset({k: x[k][0] for k in keys})
-
-        corr, lift, gt = [], [], []
-        for t in range(steps):
-            flat = flatten_state(state).to(self.device)
-            # policy mean, not a sample: deterministic across epochs
-            action = self.actor.net(flat.unsqueeze(0)).squeeze(0).cpu()
-            state = env.step(unflatten_action(action), {k: x[k][t + 1] for k in keys})
-            corr.append(state["corrected_state"]["poses"].cpu())
-            lift.append(x["poses"][t].cpu())
-            gt.append(y["poses"][t].cpu())
+        corr = rollout_policy(sample, self.actor, keys=keys,
+                              device=str(self.device), max_steps=self.max_steps)
+        lift = [x["poses"][t].cpu() for t in range(steps)]
+        gt   = [y["poses"][t].cpu() for t in range(steps)]
 
         # The lifted cameras and the GT are normalised with *different* stats
         # (data/norm_upsample.py: normalization_lifted_pg{1,2}.json vs
@@ -276,7 +267,8 @@ class ImagePoseVizLogger:
 
     def __init__(self, dataset, actor, gt_stats, calib, reproj_path,
                  video_root="demo/videos", device="cpu", n_clips=3, n_frames=4,
-                 max_steps=120, seed=0):
+                 max_steps=120, seed=0, reproj_reward=None, use_evidence=False,
+                 trans_mode="none"):
         import h5py
 
         self.dataset = dataset
@@ -286,6 +278,13 @@ class ImagePoseVizLogger:
         self.device = torch.device(device)
         self.n_frames = n_frames
         self.max_steps = max_steps
+        # The policy's observation contains the reward's 2D residual, so the
+        # logger needs its own reward instance to reproduce it. Its `reset` binds
+        # to one clip, which is why this cannot be the trainer's — that one is
+        # bound to whichever clip the rollout is on.
+        self.reproj_reward = reproj_reward
+        self.use_evidence = bool(use_evidence) and reproj_reward is not None
+        self.trans_mode = trans_mode
         video_root = Path(video_root)
 
         # Pick clips once, at construction, so every figure shows the same ones.
@@ -354,15 +353,13 @@ class ImagePoseVizLogger:
             return None
 
         keys = ("poses", "trans")
-        env = MoviEnv(device=str(self.device))
-        state = env.reset({k: x[k][0] for k in keys})
-
-        corr = []
-        for t in range(steps):
-            flat = flatten_state(state).to(self.device)
-            action = self.actor.net(flat.unsqueeze(0)).squeeze(0).cpu()
-            state = env.step(unflatten_action(action), {k: x[k][t + 1] for k in keys})
-            corr.append(state["corrected_state"]["poses"].cpu().numpy())
+        # Same observation the trainer builds, including the 2D evidence block —
+        # a figure drawn from a differently-shaped observation would be measuring
+        # a policy that never existed.
+        corr = [c.numpy() for c in rollout_policy(
+            sample, self.actor, keys=keys, device=str(self.device),
+            reproj_reward=self.reproj_reward, use_evidence=self.use_evidence,
+            max_steps=self.max_steps, trans_mode=self.trans_mode)]
 
         # Sample frames evenly, but only from frames that carry 2D evidence —
         # a panel with no detection would have nothing to compare against.

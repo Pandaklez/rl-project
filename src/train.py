@@ -17,6 +17,8 @@ import torch
 from skrl.agents.torch.ppo import PPO, PPO_DEFAULT_CONFIG
 from skrl.envs.wrappers.torch import wrap_env
 from skrl.memories.torch import RandomMemory
+from skrl.resources.preprocessors.torch import RunningStandardScaler
+from skrl.resources.schedulers.torch import KLAdaptiveRL
 from skrl.trainers.torch import SequentialTrainer
 
 from src.data.datasets import MoViDataset
@@ -82,6 +84,19 @@ class PPOWithPoseViz(PPO):
                 self.track_data("Reprojection / improvement over lifted (px)",
                                 float(info["err_px_lifted"]) - float(info["err_px"]))
 
+        # The translation action, so the two trans modes can be compared directly
+        # in TensorBoard: du/dv say how far the policy is sliding the body in the
+        # image, dlog_tz whether it is drifting in the direction the reward
+        # cannot see (it is structurally 0 under --trans_mode uv).
+        for key, tag in (("trans_du",    "Translation / du (bbox heights)"),
+                         ("trans_dv",    "Translation / dv (bbox heights)"),
+                         ("trans_dlogz", "Translation / dlog_tz")):
+            if ok(info.get(key)):
+                self.track_data(tag, float(info[key]))
+                if key != "trans_dlogz":
+                    self.track_data(tag.replace(" (bbox", " |abs| (bbox"),
+                                    abs(float(info[key])))
+
         if "valid" in info:
             self.track_data("Reprojection / frames with 2D evidence",
                             1.0 if info["valid"] else 0.0)
@@ -124,9 +139,29 @@ class Config:
     gae_lambda:         float = 0.95
     ratio_clip:         float = 0.2
     value_clip:         float = 0.2
-    entropy_loss_scale: float = 0.01
+    # Fix 04: zero. The action is a residual around an already-good pose, so
+    # there is nothing to explore; meanwhile the bonus's gradient w.r.t. log_std
+    # is a constant +1 per dimension regardless of reward, which was one of the
+    # two forces inflating sigma to divergence.
+    entropy_loss_scale: float = 0.0
     value_loss_scale:   float = 1.0
     grad_norm_clip:     float = 0.5
+    # Fix 07: a KL-adaptive learning rate, so a divergence throttles itself
+    # instead of running unattended for eight hours.
+    #
+    # **Not skrl's default 0.008.** For two Gaussians with a shared sigma the KL
+    # is `(D/2)·(dmu/sigma)²`, so the trust region a threshold buys depends on
+    # the action dimension and on sigma — and this policy is extreme in both: 156
+    # dims and sigma = 0.05, twenty times smaller than a typical continuous-
+    # control policy because the action is a residual around an already-good
+    # pose. At 0.008 one update may move the mean by 1.0% of sigma, which is
+    # 5e-4 in pose units against a mean scale of 8e-3. Measured: the scheduler
+    # floors the learning rate at skrl's min_lr of 1e-6 within three updates and
+    # learning stops.
+    #
+    # 0.05 corresponds to 2.5% of sigma per update — still a tight trust region,
+    # but one an Adam step at 1e-4 can actually stay inside.
+    kl_threshold:       float = 0.05
 
     # Reward weights
     w_similarity: float = 1.0
@@ -140,17 +175,27 @@ class Config:
     reproj_path:  str   = "data/reproj_targets.h5"
     w_reproj:     float = 1.0
     reproj_sigma: float = 0.04
-    baseline_every: int = 10    # score the raw lifted frame every N steps (0 = off)
+    # How often the lifted-vs-corrected comparison is *logged*. The projection
+    # itself now happens every frame regardless, because the observation needs it
+    # (fix 06), so this no longer buys any compute back.
+    baseline_every: int = 1
+    # Fix 05: reward = r_corrected - r_lifted, per step.
+    reward_baseline: bool = True
+    # Fix 06: put the reward's own 2D residual into the observation.
+    use_evidence: bool = True
 
-    # Pose-only training (§2). The lifted `trans` is virtual-camera depth, not
-    # metres, so by default the policy corrects poses only and the translation
-    # is passed through. --predict_trans restores the old 159-d action as an
-    # ablation.
-    predict_trans: bool = False
+    # Translation (§2). The lifted `trans` is virtual-camera depth, not metres,
+    # so it is never corrected as a normalised delta — it is passed through, and
+    # the policy's translation action is reparameterised into image-plane
+    # coordinates instead.
+    # Translation action (src/models/policy.py): "none" freezes it entirely,
+    # "uv" gives the policy an image-plane shift only, "uvz" also unfreezes
+    # log-depth as an ablation.
+    trans_mode: str = "none"
 
-    # Policy architecture
+    # Policy architecture. Dropout is gone, not defaulted to 0 — see
+    # src/models/policy.py::_mlp for why it was the cause of the (B) divergence.
     hidden_dims: tuple = (512, 256)
-    dropout:     float = 0.1
 
     # Training duration
     total_updates: int = 3000   # total_updates * rollouts = total timesteps
@@ -198,7 +243,9 @@ def train(cfg: Config) -> None:
             # Under pose-only training the policy never moves `trans`, so there
             # is nothing to re-derive: use the metric translation already in the
             # sidecar, which is the path the 11.6 / 14.5 px validation measured.
-            correct_translation=cfg.predict_trans,
+            # The reparameterised translation action is applied to the metric
+            # translation directly, so the virtual-camera path stays off.
+            correct_translation=False,
         )
         print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT")
     else:
@@ -214,10 +261,21 @@ def train(cfg: Config) -> None:
         reproj_reward=reproj_reward,
         w_reproj=cfg.w_reproj,
         baseline_every=cfg.baseline_every,
-        predict_trans=cfg.predict_trans,
+        trans_mode=cfg.trans_mode,
+        reward_baseline=cfg.reward_baseline,
+        use_evidence=cfg.use_evidence,
     )
-    print(f"Action: {gym_env.action_space.shape[0]}-d "
-          f"({'poses + trans' if cfg.predict_trans else 'poses only, trans passed through'})")
+    _TRANS_DESC = {"none": "poses only, translation frozen",
+                   "uv":   "poses + du,dv image shift (log-depth frozen)",
+                   "uvz":  "poses + du,dv,dlog_tz (depth unfrozen — ablation)"}
+    print(f"Action: {gym_env.action_space.shape[0]}-d ({_TRANS_DESC[cfg.trans_mode]}), "
+          f"pose delta bounded to +-{gym_env.action_space.high[0]:g}")
+    print(f"Observation: {gym_env.observation_space.shape[0]}-d "
+          + ("(pose + 2D evidence: residual, confidence, error, progress, camera)"
+             if gym_env.use_evidence else "(pose only — the reward is NOT observable)"))
+    if gym_env.reward_mode == "reproj":
+        print("Reward: " + ("improvement over the lifted pose (baselined)"
+                            if gym_env.reward_baseline else "absolute level (no baseline)"))
     gym_env.reset(seed=cfg.seed)
     env = wrap_env(gym_env)
 
@@ -225,14 +283,8 @@ def train(cfg: Config) -> None:
     act_space = gym_env.action_space
 
     # ── Models ───────────────────────────────────────────────────────────────
-    actor = SkrlPoseActor(
-        obs_space, act_space, device,
-        hidden_dims=cfg.hidden_dims, dropout=cfg.dropout,
-    )
-    critic = SkrlPoseCritic(
-        obs_space, act_space, device,
-        hidden_dims=cfg.hidden_dims, dropout=cfg.dropout,
-    )
+    actor  = SkrlPoseActor(obs_space, act_space, device, hidden_dims=cfg.hidden_dims)
+    critic = SkrlPoseCritic(obs_space, act_space, device, hidden_dims=cfg.hidden_dims)
 
     n_actor  = sum(p.numel() for p in actor.parameters())
     n_critic = sum(p.numel() for p in critic.parameters())
@@ -261,6 +313,23 @@ def train(cfg: Config) -> None:
     # value target at every episode boundary is short by the entire remaining
     # return (~60 here), which is what the first (B) attempt was training against.
     ppo_cfg["time_limit_bootstrap"] = True
+
+    # Fix 02. Both were left at None. A per-step reward near 0.7 at gamma = 0.99
+    # gives returns around 70 and episode returns of 883 were logged, so the value
+    # loss started at 99 and took ~500k steps to come down — for that entire
+    # period the GAE advantage was dominated by value error rather than by which
+    # action earned reward. The state scaler matters just as much now that the
+    # observation mixes normalised pose units with pixel residuals, confidences
+    # and a one-hot, which are on entirely different scales.
+    ppo_cfg["state_preprocessor"] = RunningStandardScaler
+    ppo_cfg["state_preprocessor_kwargs"] = {"size": obs_space, "device": device}
+    ppo_cfg["value_preprocessor"] = RunningStandardScaler
+    ppo_cfg["value_preprocessor_kwargs"] = {"size": 1, "device": device}
+
+    # Fix 07. Without this a divergence just runs.
+    if cfg.kl_threshold > 0:
+        ppo_cfg["learning_rate_scheduler"] = KLAdaptiveRL
+        ppo_cfg["learning_rate_scheduler_kwargs"] = {"kl_threshold": cfg.kl_threshold}
     ppo_cfg["experiment"]["directory"]           = cfg.out_dir
     ppo_cfg["experiment"]["write_interval"]      = cfg.log_interval
     ppo_cfg["experiment"]["checkpoint_interval"] = cfg.checkpoint_interval
@@ -290,11 +359,20 @@ def train(cfg: Config) -> None:
             if want_image:
                 from src.rewards import load_calib
                 from src.viz_pose import ImagePoseVizLogger
+                from src.rewards import ReprojectionReward
                 viz_logger = ImagePoseVizLogger(
                     viz_dataset, actor, viz_stats, load_calib(cfg.h5_path),
                     cfg.reproj_path, video_root=cfg.viz_video_root,
                     device=cfg.device, n_clips=cfg.viz_clips,
                     n_frames=cfg.viz_frames, seed=cfg.seed,
+                    # Its own instance: `reset` binds a reward to one clip, and
+                    # the trainer's is bound to whatever the rollout is on.
+                    reproj_reward=ReprojectionReward(
+                        load_calib(cfg.h5_path), sigma=cfg.reproj_sigma,
+                        correct_translation=False,
+                    ),
+                    use_evidence=gym_env.use_evidence,
+                    trans_mode=cfg.trans_mode,
                 )
                 kind = f"image-plane on video ({len(viz_logger.clips)} clips)"
             else:
@@ -359,9 +437,18 @@ def main() -> None:
     parser.add_argument("--discount_factor",     type=float, default=0.99)
     parser.add_argument("--gae_lambda",          type=float, default=0.95)
     parser.add_argument("--ratio_clip",          type=float, default=0.2)
-    parser.add_argument("--entropy_loss_scale",  type=float, default=0.01)
+    parser.add_argument("--entropy_loss_scale",  type=float, default=0.0,
+                        help="0 by default: the action is a residual around a good "
+                             "initial guess, so there is nothing to explore and the "
+                             "bonus only inflates the policy standard deviation")
     parser.add_argument("--value_loss_scale",    type=float, default=1.0)
     parser.add_argument("--grad_norm_clip",      type=float, default=0.5)
+    parser.add_argument("--kl_threshold",        type=float, default=0.05,
+                        help="target KL for the adaptive learning-rate scheduler "
+                             "(0 disables it). Not skrl's 0.008: at 156 action "
+                             "dims and sigma=0.05 that allows a mean step of 1%% "
+                             "of sigma and floors the learning rate in three "
+                             "updates. See Config.kl_threshold.")
     parser.add_argument("--w_similarity",        type=float, default=1.0)
     parser.add_argument("--w_smoothness",        type=float, default=0.1)
     parser.add_argument("--reward_scale",        type=float, default=10.0)
@@ -370,13 +457,27 @@ def main() -> None:
     parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
     parser.add_argument("--w_reproj",            type=float, default=1.0)
     parser.add_argument("--reproj_sigma",        type=float, default=0.04)
-    parser.add_argument("--predict_trans",       action="store_true",
-                        help="also correct the lifted translation (159-d action). "
-                             "Off by default: lifted trans is virtual-camera depth, "
-                             "not metres (§2), so the policy trains on pose alone.")
+    parser.add_argument("--trans_mode", choices=("none", "uv", "uvz"), default="none",
+                        help="translation action. 'none' (156-d) freezes it. 'uv' "
+                             "(158-d) lets the policy shift the body in the image "
+                             "plane in bbox-height units — the coordinates the "
+                             "reprojection reward is actually sensitive in — with "
+                             "log-depth structurally frozen. 'uvz' (159-d) "
+                             "unfreezes log-depth as an ablation.")
     parser.add_argument("--baseline_every",      type=int,   default=10,
                         help="score the raw lifted frame every N steps for comparison (0 disables)")
-    parser.add_argument("--dropout",             type=float, default=0.1)
+    parser.add_argument("--no_reward_baseline",  dest="reward_baseline",
+                        action="store_false",
+                        help="score the absolute reprojection reward instead of the "
+                             "improvement over the lifted pose. Off by default "
+                             "because the absolute level is ~0.68 of constant the "
+                             "policy cannot influence.")
+    parser.add_argument("--no_evidence",         dest="use_evidence",
+                        action="store_false",
+                        help="drop the 2D residual block from the observation, "
+                             "leaving the 318-d pose-only state. Reproduces the "
+                             "setting in which the reward is unobservable — for "
+                             "the ablation, not for a real run.")
     parser.add_argument("--total_updates",       type=int,   default=3000)
     parser.add_argument("--out_dir",             default="checkpoints")
     parser.add_argument("--log_interval",        type=int,   default=200)
