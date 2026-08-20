@@ -4,6 +4,7 @@ PPO training using skrl.
 Usage:
     python -m src.train [args]
 """
+# TODO: add GAIL to training. 
 from __future__ import annotations
 
 import argparse
