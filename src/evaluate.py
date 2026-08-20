@@ -112,6 +112,27 @@ def pa_mpjpe(pred: torch.Tensor, gt: torch.Tensor) -> float:
     return (procrustes_align(pred, gt) - gt).pow(2).sum(dim=-1).sqrt().mean().item()
 
 
+# ─── Joint sets ───────────────────────────────────────────────────────────────
+#
+# Which joints the error is averaged over changes the number by a third, so it
+# has to be stated alongside any figure. SMPL-X's 22 body joints include the
+# pelvis, three spine joints, two collars, the neck and the head — all close to
+# the body axis and nearly free to match once Procrustes has aligned the pose.
+# Published PA-MPJPE uses the 14-joint H3.6M convention.
+#
+# Measured on the lifted baseline, test split: all22 30.2 mm, j14 34.1 mm,
+# limbs 40.7 mm — same poses, same alignment, three different headlines.
+JOINT_SETS = {
+    "all22": list(range(22)),
+    "j14":   [1, 2, 4, 5, 7, 8, 16, 17, 18, 19, 20, 21, 12, 15],
+    "limbs": [4, 5, 7, 8, 18, 19, 20, 21],
+}
+
+
+def select_joints(j: torch.Tensor, joint_set: str) -> torch.Tensor:
+    return j[:, JOINT_SETS[joint_set], :]
+
+
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def unnormalize_np(arr: np.ndarray, key: str, stats: dict) -> np.ndarray:
@@ -149,8 +170,23 @@ def eval_lifted_baseline(
     cameras: tuple[str, ...],
     split: str,
     device: str = "cpu",
+    joint_set: str = "all22",
+    betas_source: str = "gt",
 ) -> dict:
+    """
+    PA-MPJPE of the uncorrected lifted pose against GT.
+
+    `betas_source="gt"` gives the prediction the ground-truth shape, so bone
+    lengths match exactly and the metric reflects joint angles alone. That is
+    the right choice for isolating what a correction policy can change — it only
+    moves angles — but it is *not* the benchmark setting, which uses the
+    predicted shape. `"lifted"` uses SMPLer-X's own betas instead.
+    """
     scores: list[float] = []
+    # Per clip-camera as well, keyed, so this can be paired against the model
+    # results, which are per clip-camera rather than per clip.
+    per_cam: list[float] = []
+    per_cam_keys: list[str] = []
 
     with h5py.File(processed_h5_path, "r") as proc_f, \
          h5py.File(lifted_h5_path,    "r") as lift_f:
@@ -166,21 +202,27 @@ def eval_lifted_baseline(
             if clip_name not in lift_f[split]:
                 continue
 
-            # GT betas are used for both sides so the metric reflects pose error
-            # alone; the lifted shape estimate is near-chance and would only add
-            # noise to a pose benchmark.
-            gt_joints = joints_from_poses(gt_pose, betas, device=device)
+            gt_joints = select_joints(
+                joints_from_poses(gt_pose, betas, device=device), joint_set)
 
             clip_scores: list[float] = []
-            for cam in cameras:
+            for cam in cameras:  # noqa: PLR1702
                 if cam not in lift_f[split][clip_name]:
                     continue
-                lift_raw = lift_f[split][clip_name][cam]["poses"][:].astype(np.float32)
+                cam_grp  = lift_f[split][clip_name][cam]
+                lift_raw = cam_grp["poses"][:].astype(np.float32)
                 lift_up  = upsample_to(lift_raw, T)                   # (T, J, 3)
-                clip_scores.append(pa_mpjpe(
-                    joints_from_poses(lift_up, betas, device=device),
+                # The lifted betas in this file are raw, not normalised.
+                pred_betas = (betas if betas_source == "gt"
+                              else cam_grp["betas"][:].astype(np.float32))
+                score = pa_mpjpe(
+                    select_joints(
+                        joints_from_poses(lift_up, pred_betas, device=device), joint_set),
                     gt_joints,
-                ))
+                )
+                clip_scores.append(score)
+                per_cam.append(score)
+                per_cam_keys.append(f"{clip_name}__{cam}")
 
             if clip_scores:
                 scores.append(float(np.mean(clip_scores)))
@@ -188,7 +230,11 @@ def eval_lifted_baseline(
             if (i + 1) % 20 == 0:
                 print(f"  [baseline {i+1:4d}/{len(clip_names)}]  PA-MPJPE={np.mean(scores):.5f}")
 
-    return {"pa_mpjpe_lifted_raw": float(np.mean(scores)), "n_clips_baseline": len(scores)}
+    return {"pa_mpjpe_lifted_raw": float(np.mean(scores)),
+            "n_clips_baseline": len(scores),
+            "per_clip_lifted": [float(v) for v in scores],
+            "per_cam_lifted": [float(v) for v in per_cam],
+            "per_cam_keys_lifted": per_cam_keys}
 
 
 # ─── Mode 2: model checkpoint ─────────────────────────────────────────────────
@@ -202,6 +248,9 @@ def eval_model(
     reproj_reward = None,
     use_evidence:  bool = False,
     trans_mode:    str  = "none",
+    state_trans:   bool = True,
+    joint_set:     str  = "all22",
+    betas_source:  str  = "gt",
 ) -> dict:
     """
     PA-MPJPE of the corrected pose against GT.
@@ -211,18 +260,32 @@ def eval_model(
     evaluated on the 318-d one does not raise; it silently scores badly, which
     reads as a negative result rather than as the bug it is. `main` reads the
     flag out of the checkpoint's config for exactly that reason.
+
+    **The corrected pose is unnormalised with the per-camera *lifted* stats, not
+    the GT stats.** The policy's output lives in the same normalised space as
+    its input, and `data/norm_upsample.py` scales the lifted cameras with
+    `normalization_lifted_pg{1,2}.json` while GT uses `data/normalization.json`.
+    Using the GT stats produces a plausible-looking pose that is simply the wrong
+    one — measured at 31 deg mean per-joint error when the same mistake was found
+    in `src/viz_pose.py`. It would not raise; it would just report a bad score.
     """
+    from src.rewards import load_lifted_stats
+
     actor.eval()
 
     corrected_scores: list[float] = []
+    corrected_keys: list[str] = []
 
     for idx in range(len(dataset)):
         sample = dataset[idx]
         y      = sample["y"]
+        camera = sample["meta"]["camera"]
+        clip_key = f'{sample["meta"]["clip"]}__{camera.upper()}'
 
         corr_frames = rollout_policy(
             sample, actor, device=str(device), reproj_reward=reproj_reward,
             use_evidence=use_evidence, deterministic=True, trans_mode=trans_mode,
+            state_trans=state_trans,
         )
         if not corr_frames:
             continue
@@ -231,19 +294,35 @@ def eval_model(
         corr_n = torch.stack(corr_frames)   # (T-1, J, 3), normalized
         gt_n   = torch.stack(gt_frames)     # (T-1, J, 3), normalized
 
-        corr = unnormalize_t(corr_n, "poses", norm_stats)
-        gt   = unnormalize_t(gt_n,   "poses", norm_stats)
+        lifted_stats = dict(load_lifted_stats(camera))
+        l_mu, l_sigma = lifted_stats["poses"]
+        corr = corr_n * torch.as_tensor(l_sigma).reshape(52, 3) \
+                      + torch.as_tensor(l_mu).reshape(52, 3)
+        gt   = unnormalize_t(gt_n, "poses", norm_stats)
 
-        betas = unnormalize_t(y["betas"].cpu(), "betas", norm_stats)
+        gt_betas = unnormalize_t(y["betas"].cpu(), "betas", norm_stats)
+        if betas_source == "gt":
+            pred_betas = gt_betas
+        else:
+            b_mu, b_sigma = lifted_stats["betas"]
+            pred_betas = sample["x"]["betas"].cpu() * torch.as_tensor(b_sigma) \
+                         + torch.as_tensor(b_mu)
         corrected_scores.append(pa_mpjpe(
-            joints_from_poses(corr, betas, device=str(device)),
-            joints_from_poses(gt,   betas, device=str(device)),
+            select_joints(joints_from_poses(corr, pred_betas, device=str(device)), joint_set),
+            select_joints(joints_from_poses(gt, gt_betas, device=str(device)), joint_set),
         ))
+        corrected_keys.append(clip_key)
 
         if (idx + 1) % 20 == 0:
             print(f"  [model {idx+1:4d}/{len(dataset)}]  PA-MPJPE={np.mean(corrected_scores):.5f}")
 
-    return {"pa_mpjpe_corrected": float(np.mean(corrected_scores)), "n_clips_model": len(dataset)}
+    return {"pa_mpjpe_corrected": float(np.mean(corrected_scores)),
+            "n_clips_model": len(dataset),
+            # Kept so (A) and (B) can be compared pairwise on the same clips. The
+            # clip-to-clip spread dwarfs the gap between conditions, so a paired
+            # test over these has far more power than comparing two means.
+            "per_clip_corrected": [float(v) for v in corrected_scores],
+            "per_clip_keys": corrected_keys}
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────
@@ -260,7 +339,23 @@ def main() -> None:
     parser.add_argument("--checkpoint", default=None,
                         help="Actor checkpoint .pt for model evaluation (optional)")
     parser.add_argument("--split",  default="test")
+    parser.add_argument("--joint_set", choices=tuple(JOINT_SETS), default="all22",
+                        help="joints the error is averaged over. 'all22' is every "
+                             "SMPL-X body joint (what this script has always "
+                             "reported); 'j14' is the H3.6M convention papers use; "
+                             "'limbs' is knees/ankles/elbows/wrists only. Same "
+                             "poses, ~30/34/41 mm on the lifted baseline.")
+    parser.add_argument("--betas", dest="betas_source", choices=("gt", "lifted"),
+                        default="gt",
+                        help="shape for the PREDICTION. 'gt' matches bone lengths "
+                             "exactly, isolating joint-angle error — right for "
+                             "comparing correction policies, which only move "
+                             "angles. 'lifted' uses SMPLer-X's own betas, which is "
+                             "the benchmark setting.")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    parser.add_argument("--dump_scores", default=None,
+                        help="write results including per-clip scores to this JSON, "
+                             "so conditions can be compared pairwise on the same clips")
     args = parser.parse_args()
 
     if args.lifted_h5 is None and args.checkpoint is None:
@@ -269,7 +364,9 @@ def main() -> None:
     with open(args.norm_stats_path) as f:
         norm_stats = json.load(f)
 
-    all_results: dict = {}
+    all_results: dict = {"joint_set": args.joint_set, "betas": args.betas_source}
+    print(f"\nMetric: PA-MPJPE over {len(JOINT_SETS[args.joint_set])} joints "
+          f"({args.joint_set}), prediction shape = {args.betas_source} betas")
 
     # ── Lifted baseline ───────────────────────────────────────────────────────
     if args.lifted_h5:
@@ -277,6 +374,7 @@ def main() -> None:
         res = eval_lifted_baseline(
             args.lifted_h5, args.processed_h5,
             norm_stats, tuple(args.cameras), args.split, args.device,
+            joint_set=args.joint_set, betas_source=args.betas_source,
         )
         all_results.update(res)
         print(f"  PA-MPJPE lifted (raw)  : {res['pa_mpjpe_lifted_raw']:.5f}  ({res['n_clips_baseline']} clips)")
@@ -296,14 +394,19 @@ def main() -> None:
         # block cannot be rolled out without it, and the failure is silent — it
         # just scores badly. The checkpoint records which it was.
         use_evidence = bool(cfg.get("use_evidence", False)) and cfg.get("reward_mode") == "reproj"
+        # Defaults to True so checkpoints written before the flag existed still
+        # load with the 318-d state they were trained on.
+        state_trans = bool(cfg.get("state_trans", True))
         actor = PoseActor(hidden_dims=tuple(cfg["hidden_dims"]),
                           trans_mode=trans_mode,
-                          use_evidence=use_evidence).to(device)
+                          use_evidence=use_evidence,
+                          state_trans=state_trans).to(device)
         actor.load_state_dict(ckpt["actor"])
         print(f"\n── Model: {args.checkpoint} ──")
         print(f"  Action: {act_dim}-d (trans_mode={trans_mode})")
         print(f"  Observation: {actor.net[0].in_features}-d "
-              f"({'pose + 2D evidence' if use_evidence else 'pose only'})")
+              f"({'poses' if not state_trans else 'poses + trans'}"
+              f"{' + 2D evidence' if use_evidence else ''})")
 
         dataset = MoViDataset(
             args.processed_h5, args.norm_stats_path,
@@ -322,13 +425,22 @@ def main() -> None:
 
         res = eval_model(actor, dataset, norm_stats, device,
                          reproj_reward=reproj_reward, use_evidence=use_evidence,
-                         trans_mode=trans_mode)
+                         trans_mode=trans_mode, state_trans=state_trans,
+                         joint_set=args.joint_set, betas_source=args.betas_source)
         all_results.update(res)
         print(f"  PA-MPJPE corrected     : {res['pa_mpjpe_corrected']:.5f}  ({res['n_clips_model']} clips)")
 
     print("\n=== Summary ===")
     for k, v in all_results.items():
-        print(f"  {k}: {v}")
+        if k.startswith("per_clip_"):
+            print(f"  {k}: [{len(v)} values]")
+        else:
+            print(f"  {k}: {v}")
+
+    if args.dump_scores:
+        with open(args.dump_scores, "w") as f:
+            json.dump(all_results, f)
+        print(f"  scores written to {args.dump_scores}")
 
 
 if __name__ == "__main__":

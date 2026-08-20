@@ -14,22 +14,41 @@ BETAS_DIM = 16
 FRAME_DIM = POSE_DIM + TRANS_DIM        # 159 — one frame of poses + trans
 STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1}
 
+# ...and the same state without translation. The lifted `trans` is SMPLer-X's
+# virtual-camera depth, not metres, so it is not a quantity the policy can
+# interpret: it cannot be corrected (that is why the action dropped it) and it
+# is not in the same space as anything else in the observation. Carrying it in
+# the state only offers the network 3 numbers whose units it has no way to
+# learn. `state_trans=False` removes it; the value is still kept inside the env
+# and handed to the reprojection reward, which *does* need it.
+FRAME_DIM_NO_TRANS = POSE_DIM           # 156
+STATE_DIM_NO_TRANS = 2 * FRAME_DIM_NO_TRANS   # 312
+
 # Width of the 2D-evidence block (src/rewards.py owns the layout). Imported by
 # value rather than re-derived so the two cannot drift apart.
 from src.rewards import EVIDENCE_DIM     # noqa: E402  (44)
 
 
-def state_dim(use_evidence: bool = False, use_betas: bool = False) -> int:
+def state_dim(use_evidence: bool = False, use_betas: bool = False,
+              state_trans: bool = True) -> int:
     """
     Observation width.
 
-    Without evidence this is the historical 318: the lifted frame and the
-    previous corrected frame, and nothing about the image the reward scores
-    against. With it, 362 — see `src/rewards.pack_evidence` for why that is the
-    difference between a policy that can learn and one whose optimum is the
-    identity.
+    Four combinations, all of which have to line up between the trainer,
+    `src/viz_pose.py` and `src/evaluate.py` — a policy fed the wrong width does
+    not raise, it silently produces nonsense:
+
+        state_trans=True,  use_evidence=False   318   the original
+        state_trans=True,  use_evidence=True    362   + the 2D residual block
+        state_trans=False, use_evidence=False   312   pose-only state
+        state_trans=False, use_evidence=True    356   pose-only + residual
+
+    See `src/rewards.pack_evidence` for why the evidence block is the difference
+    between a policy that can learn and one whose optimum is the identity, and
+    `STATE_DIM_NO_TRANS` for why dropping `trans` from the state costs nothing.
     """
-    return STATE_DIM + (EVIDENCE_DIM if use_evidence else 0) + (BETAS_DIM if use_betas else 0)
+    base = STATE_DIM if state_trans else STATE_DIM_NO_TRANS
+    return base + (EVIDENCE_DIM if use_evidence else 0) + (BETAS_DIM if use_betas else 0)
 
 
 # Bound on one correction delta, in normalised pose units (fix 03).
@@ -186,6 +205,11 @@ def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.
         state["corrected_state"]["poses"] (..., 52, 3)
         state["corrected_state"]["trans"] (..., 3)
 
+    Accepts either state shape. `MoviEnv` stores each slot as a
+    `{"poses", "trans"}` dict; `NoTransMoviEnv` stores a bare pose tensor and
+    keeps the translation to itself. Which one it is follows from the type, so
+    no caller has to pass a flag.
+
     `evidence` is the EVIDENCE_DIM block from `src.rewards.pack_evidence`: the
     2D residual the reward is computed from, plus the context needed to act on
     it. Passing it is what makes the reward observable at all — see fix 06.
@@ -199,12 +223,17 @@ def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.
     """
     lifted    = state["lifted_state"]
     corrected = state["corrected_state"]
-    parts = [
-        lifted["poses"].flatten(-2),      # (..., 156)
-        lifted["trans"],                   # (..., 3)
-        corrected["poses"].flatten(-2),    # (..., 156)
-        corrected["trans"],                # (..., 3)
-    ]
+    if isinstance(lifted, torch.Tensor):
+        # Pose-only state (NoTransMoviEnv): the two slots are (..., 52, 3)
+        # tensors rather than dicts, because there is no second key to hold.
+        parts = [lifted.flatten(-2), corrected.flatten(-2)]
+    else:
+        parts = [
+            lifted["poses"].flatten(-2),      # (..., 156)
+            lifted["trans"],                   # (..., 3)
+            corrected["poses"].flatten(-2),    # (..., 156)
+            corrected["trans"],                # (..., 3)
+        ]
     if use_betas:
         parts.append(lifted["betas"])      # (..., 16)
     if evidence is not None:
@@ -336,9 +365,11 @@ class PoseActor(nn.Module):
         init_log_std: float        = INIT_LOG_STD,
         trans_mode:  str           = TRANS_MODE_NONE,
         use_evidence: bool         = False,
+        state_trans: bool          = True,
     ):
         super().__init__()
-        obs_dim      = state_dim(use_evidence=use_evidence, use_betas=use_betas)
+        obs_dim      = state_dim(use_evidence=use_evidence, use_betas=use_betas,
+                                 state_trans=state_trans)
         act_dim      = action_dim(trans_mode)
         self.net     = _mlp([obs_dim, *hidden_dims, act_dim])
         self.log_std = nn.Parameter(init_log_std_vector(trans_mode, init_log_std))
@@ -378,9 +409,11 @@ class PoseCritic(nn.Module):
         use_betas:   bool          = False,
         hidden_dims: tuple[int, ...] = (512, 256),
         use_evidence: bool         = False,
+        state_trans: bool          = True,
     ):
         super().__init__()
-        obs_dim  = state_dim(use_evidence=use_evidence, use_betas=use_betas)
+        obs_dim  = state_dim(use_evidence=use_evidence, use_betas=use_betas,
+                             state_trans=state_trans)
         self.net = _mlp([obs_dim, *hidden_dims, 1])
         self._init_weights()
 

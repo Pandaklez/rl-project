@@ -157,6 +157,7 @@ class ReprojectionReward:
         gender: str = "neutral",
         device: str = "cpu",
         lifted_stats_paths: dict | None = None,
+        bias: str | dict | None = "data/kp_bias.json",
     ):
         self.calib = calib
         self.sigma = float(sigma)
@@ -166,6 +167,17 @@ class ReprojectionReward:
         self.device = device
         self._paths = lifted_stats_paths or {}
         self._clip = None
+        # Per-joint COCO <-> SMPL-X offset, in bbox-height units. See
+        # scripts/fit_kp_bias.py: SMPL-X joints are internal kinematic centres
+        # and COCO keypoints are annotated surface landmarks, so a *correct*
+        # pose still projects ~0.02 bbox heights from a *correct* detection.
+        # That constant was 85% of the measured reprojection error — an offset
+        # no action can change, occupying most of the reward's dynamic range.
+        #
+        # `bias=None` disables the correction, which is what the fitting script
+        # itself needs (it measures the uncorrected residual) and what an
+        # ablation would use.
+        self.bias = _load_bias(bias)
 
     # ── episode setup ────────────────────────────────────────────────────────
     def reset(self, sample: dict) -> bool:
@@ -242,6 +254,12 @@ class ReprojectionReward:
             return 0.0, info
 
         delta = uv - obs[:, :2]                         # (12, 2) signed, pixels
+        # Subtract the systematic correspondence offset before the error is
+        # formed, so the reward scores the part of the disagreement a pose
+        # change can actually fix.
+        b = self._bias_for(c["camera"])
+        if b is not None:
+            delta = delta - b * (float(c["bbox"][t][3]) or 1.0)
         d = np.linalg.norm(delta, axis=-1)
         err_px = float(np.sum(w * d) / np.sum(w))
 
@@ -256,6 +274,12 @@ class ReprojectionReward:
                     n_joints=int((w > 0).sum()),
                     resid=resid.astype(np.float32))
         return reward, info
+
+    def _bias_for(self, camera: str):
+        """(12, 2) offset in bbox-height units for this camera, or None."""
+        if not self.bias:
+            return None
+        return self.bias.get(str(camera).upper())
 
     def context(self, t: int) -> np.ndarray:
         """
@@ -361,6 +385,44 @@ class ReprojectionReward:
         out[0, 0] += du * h * z / fx
         out[0, 1] += dv * h * z / fy
         return out
+
+
+def _load_bias(bias):
+    """
+    Resolve the `bias` argument to `{CAM: (12, 2) array}` or None.
+
+    Accepts a path, an already-loaded dict, or None. A missing file is not an
+    error — the correction is an improvement on the reward, not a prerequisite
+    for it — but it says so, because silently scoring against an uncorrected
+    residual is how a 10 px constant goes unnoticed for months.
+    """
+    if bias is None:
+        return None
+    if isinstance(bias, dict) and not isinstance(bias.get("_units"), str):
+        return {k.upper(): np.asarray(v, dtype=np.float32) for k, v in bias.items()}
+    if isinstance(bias, dict):
+        raw = bias
+    else:
+        path = Path(bias)
+        if not path.is_absolute():
+            path = REPO / path
+        if not path.exists():
+            print(f"NOTE: no keypoint-bias file at {path}; scoring the raw "
+                  f"residual, which carries a systematic ~0.02 bbox-height "
+                  f"offset. Run `python -m scripts.fit_kp_bias` to fit one.")
+            return None
+        with open(path) as f:
+            raw = json.load(f)
+    out = {}
+    for key, value in raw.items():
+        if key.startswith("_"):
+            continue
+        arr = np.asarray(value, dtype=np.float32)
+        if arr.shape != (N_KP, 2):
+            raise ValueError(
+                f"keypoint bias for {key} must be ({N_KP}, 2), got {arr.shape}")
+        out[key.upper()] = arr
+    return out or None
 
 
 def empty_info() -> dict:

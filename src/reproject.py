@@ -88,17 +88,40 @@ COCO_IDX = np.array([c for c, _ in COCO17_TO_SMPLX], dtype=np.int64)
 SMPLX_IDX = np.array([s for _, s in COCO17_TO_SMPLX], dtype=np.int64)
 
 
+# MATLAB's Camera Calibrator reports the principal point in **1-based** pixel
+# coordinates: the centre of the top-left pixel is (1, 1). numpy and OpenCV are
+# 0-based, with that same pixel centre at (0, 0). Using the reported value
+# unshifted therefore places every projected point one pixel right and one pixel
+# down of where it belongs.
+#
+# It is a small term next to the ~10 px systematic offset measured between
+# SMPL-X joints and ViTPose keypoints (scripts/fit_kp_bias.py), and the
+# empirical bias correction absorbs it either way — but it is wrong, it is in
+# the same direction as that offset, and it affects everything that projects,
+# including the visualisations and scripts/check_extrinsics.py.
+MATLAB_PIXEL_ORIGIN = 1.0
+
+
 def real_intrinsics(intrinsic_matrix: np.ndarray) -> tuple[float, float, float, float]:
     """
-    (fx, fy, cx, cy) from a MoVi `cameraParams_*.npz` IntrinsicMatrix.
+    (fx, fy, cx, cy) from a MoVi `cameraParams_*.npz` IntrinsicMatrix, in
+    0-based pixel coordinates.
 
-    MATLAB's Camera Calibrator stores K transposed (row-vector convention), so
-    the principal point sits in the bottom row rather than the right column.
+    Two MATLAB conventions have to be undone, not one:
+
+    * K is stored transposed (row-vector convention), so the principal point
+      sits in the bottom row rather than the right column. Reading it from the
+      right column yields (0, 0), which is why this is easy to catch.
+    * Pixel coordinates are 1-based, so the principal point is shifted by one
+      pixel relative to numpy's convention. This one is *not* easy to catch: it
+      is a one-pixel error that looks like nothing until it is measured.
     """
     K = np.asarray(intrinsic_matrix, dtype=np.float64)
     if K.shape != (3, 3):
         raise ValueError(f"IntrinsicMatrix must be 3x3, got {K.shape}")
-    return float(K[0, 0]), float(K[1, 1]), float(K[2, 0]), float(K[2, 1])
+    return (float(K[0, 0]), float(K[1, 1]),
+            float(K[2, 0]) - MATLAB_PIXEL_ORIGIN,
+            float(K[2, 1]) - MATLAB_PIXEL_ORIGIN)
 
 
 def crop_intrinsics(bbox: np.ndarray, atol: float = 1e-3):

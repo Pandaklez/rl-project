@@ -69,6 +69,78 @@ class MoviEnv:
         return self.state
 
 
+class NoTransMoviEnv:
+    """
+    Pose-only state. Translation is kept internally, for the reward only.
+
+    `MoviEnv` carries `trans` in the observation as well as the pose. That was
+    never useful: the lifted `trans` is SMPLer-X's cam_trans in a cropped-bbox
+    virtual camera with a 5000 px focal, so a subject 4.5 m away is stored at
+    z ~= 42. It is not metres, there is no rigid transform from it to the room,
+    and the policy has no way to learn what its units mean. It is also not
+    correctable — that is why the action dropped it — so its only role in the
+    state was to occupy three inputs the network had to learn to ignore.
+
+    The reprojection reward is a different matter: it genuinely needs a
+    translation to place the body in the camera. So the value is kept here,
+    advanced with the clip, and handed out on request.
+
+    Two attributes, mirroring the two pose slots so the frame each belongs to is
+    never in doubt:
+
+        corrected_trans   pairs with `corrected_state` — the frame just acted on
+        lifted_trans      pairs with `lifted_state`    — the frame next to act on
+
+    Getting that pairing wrong scores frame t's pose against frame t+1's
+    translation, which at walking speed is a few centimetres of silent error in
+    the reward and nothing that would ever raise.
+    """
+
+    def __init__(self, device: str = "cpu"):
+        self.device = torch.device(device)
+        self.trans_delta = None
+        self.corrected_trans = None
+        self.lifted_trans = None
+
+    def reset(self, init_state: dict) -> dict:
+        """
+        Initialise the episode from the first lifted frame.
+
+        The corrected slot starts as a copy of the lifted pose — the identity
+        correction — not `zeros_like`. Zero in normalised units is the dataset's
+        *mean pose*, which no frame of any episode looks like, so starting there
+        made the first observation of every episode the only one drawn from a
+        different distribution than the rest.
+        """
+        lifted = _to_tensor(init_state["poses"], self.device)
+        self.state = {
+            "lifted_state": lifted,
+            "corrected_state": lifted.clone(),
+        }
+        trans = _to_tensor(init_state["trans"], self.device)
+        self.corrected_trans = trans
+        self.lifted_trans = trans.clone()
+        self.trans_delta = None
+        return self.state
+
+    def step(self, action: dict, next_lifted: dict) -> dict:
+        """
+        Apply the correction and advance to the next lifted frame.
+
+        action      : {"poses": (52, 3), "trans_delta": (3,)} from `unflatten_action`
+        next_lifted : {"poses": (52, 3), "trans": (3,)} — the clip at t+1
+        """
+        self.state["corrected_state"] = (
+            self.state["lifted_state"] + action["poses"].to(self.device))
+        # The translation the corrected pose belongs to is the one currently
+        # held, *before* the clip advances.
+        self.corrected_trans = self.lifted_trans
+        self.state["lifted_state"] = _to_tensor(next_lifted["poses"], self.device)
+        self.lifted_trans = _to_tensor(next_lifted["trans"], self.device)
+        self.trans_delta = action.get("trans_delta")
+        return self.state
+
+
 # TODO: this metrics should be pulled from evaluate.py because we want the metrics to be the same
 def compute_reward(
     corrected:      dict[str, torch.Tensor],
@@ -131,12 +203,13 @@ class GymMoviEnv(gymnasium.Env):
         w_smoothness: float = 0.1,
         reward_scale: float = 10.0,
         reward_mode:  str   = "gt",
-        reproj_reward=None,
+        reproj_reward=None,  #  ReprojectionReward instance passed in train.py
         w_reproj:     float = 1.0,
         baseline_every: int = 1,
         trans_mode: str = TRANS_MODE_NONE,
         reward_baseline: bool = True,
         use_evidence: bool = True,
+        state_trans: bool = True,
     ):
         super().__init__()
         self.dataset      = dataset
@@ -179,6 +252,13 @@ class GymMoviEnv(gymnasium.Env):
         # 2D targets to show under `reward_mode="gt"`.
         self.use_evidence = bool(use_evidence) and reward_mode == "reproj"
 
+        # Whether `trans` appears in the observation at all. With it off the
+        # state is poses only (312 dims, or 356 with the evidence block) and the
+        # translation lives inside the inner env, where the reprojection reward
+        # can still reach it. See NoTransMoviEnv for why carrying it in the state
+        # was never useful.
+        self.state_trans = bool(state_trans)
+
         if reward_mode not in ("gt", "reproj"):
             raise ValueError(f"reward_mode must be 'gt' or 'reproj', got {reward_mode!r}")
         if reward_mode == "reproj" and reproj_reward is None:
@@ -188,7 +268,8 @@ class GymMoviEnv(gymnasium.Env):
 
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
-            shape=(state_dim(use_evidence=self.use_evidence),), dtype=np.float32,
+            shape=(state_dim(use_evidence=self.use_evidence,
+                             state_trans=self.state_trans),), dtype=np.float32,
         )
         # Fix 03: finite bounds. This was `[-inf, inf]` with `clip_actions=False`,
         # so a corrupted gradient had nothing to walk into — the correction grew
@@ -201,12 +282,14 @@ class GymMoviEnv(gymnasium.Env):
             shape=(action_dim(trans_mode),), dtype=np.float32,
         )
 
-        self._inner          = MoviEnv(device=device, keys=keys)
+        self._inner = (MoviEnv(device=device, keys=keys) if self.state_trans
+                       else NoTransMoviEnv(device=device))
         self._x              = None
         self._y              = None
         self._t:   int       = 0
         self._T:   int       = 0
-        self._prev_corrected = None
+        self._prev_poses     = None
+        self._prev2_poses    = None
         self._state          = None
         # (frame index, reward, info) for the untouched lifted pose. Written when
         # the observation for a frame is built and read back as that frame's
@@ -224,10 +307,11 @@ class GymMoviEnv(gymnasium.Env):
         self._t      = 0
 
         state = self._inner.reset({k: self._x[k][0] for k in self.keys})
-        self._prev_corrected = {k: state["corrected_state"][k].clone() for k in self.keys}
+        self._state = state
+        poses, _ = self._corrected()
+        self._prev_poses = poses.clone()
         # Acceleration needs two frames of history, not one.
-        self._prev2_corrected = {k: v.clone() for k, v in self._prev_corrected.items()}
-        self._state          = state
+        self._prev2_poses = poses.clone()
 
         self._lifted_eval = None
         if self.reward_mode == "reproj":
@@ -247,21 +331,21 @@ class GymMoviEnv(gymnasium.Env):
         next_lifted = {k: self._x[k][self._t + 1] for k in self.keys}
 
         self._state = self._inner.step(action_dict, next_lifted)
-        corrected_t = {k: self._state["corrected_state"][k] for k in self.keys}
+        corrected_poses, corrected_trans = self._corrected()
 
         # Fix 03, second half. With the action bounded and the lifted input
         # finite this is unreachable, which is the point: it is the assertion
         # that says so, and it ends one episode instead of raising eight hours
         # into a run from inside `Rotation.from_rotvec`.
-        terminated = not bool(torch.isfinite(corrected_t["poses"]).all())
+        terminated = not bool(torch.isfinite(corrected_poses).all())
 
         if self.reward_mode == "reproj":
             # GT is deliberately not read on this path.
-            reward, info = self._reproj_step(corrected_t)
+            reward, info = self._reproj_step(corrected_poses, corrected_trans)
         else:
             gt_current = {k: self._y[k][self._t].to(self.device) for k in self.keys}
             reward = compute_reward(
-                corrected_t, gt_current, self._prev_corrected,
+                {"poses": corrected_poses}, gt_current, {"poses": self._prev_poses},
                 self.w_similarity, self.w_smoothness, self.reward_scale,
                 keys=self.reward_keys,
             )
@@ -283,10 +367,25 @@ class GymMoviEnv(gymnasium.Env):
         # requires `time_limit_bootstrap=True` in the PPO config, set in
         # src/train.py.
         truncated = self._t >= self._T - 1
-        self._prev2_corrected = self._prev_corrected
-        self._prev_corrected = {k: corrected_t[k].clone() for k in self.keys}
+        self._prev2_poses = self._prev_poses
+        self._prev_poses = corrected_poses.clone()
 
         return self._observation(), reward, terminated, truncated, info
+
+    # ── state accessors ──────────────────────────────────────────────────────
+    def _corrected(self) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        (corrected poses, the translation belonging to that same frame).
+
+        The two inner envs store the state differently — `MoviEnv` keeps a
+        `{"poses", "trans"}` dict, `NoTransMoviEnv` keeps a bare pose tensor and
+        holds the translation aside — so everything downstream goes through here
+        rather than reaching into the state dict and having to know which.
+        """
+        corrected = self._state["corrected_state"]
+        if isinstance(corrected, torch.Tensor):
+            return corrected, self._inner.corrected_trans
+        return corrected["poses"], corrected["trans"]
 
     # ── observation ──────────────────────────────────────────────────────────
     def _t_frac(self) -> float:
@@ -353,18 +452,28 @@ class GymMoviEnv(gymnasium.Env):
             poses[max(t - 2, 0)].detach().cpu().numpy(),
         )
 
-    def _reproj_step(self, corrected_t: dict) -> tuple[float, dict]:
-        """Reprojection + smoothness, no ground truth involved."""
+    def _reproj_step(self, corrected_poses: torch.Tensor,
+                     corrected_trans: torch.Tensor) -> tuple[float, dict]:
+        """
+        Reprojection + smoothness, no ground truth involved.
+
+        `corrected_trans` is passed in rather than read off the state, because
+        under `state_trans=False` it is not in the state at all — the whole point
+        of that mode is that the policy never sees it while the reward still
+        does. It has to be the translation for *this* frame; see
+        `NoTransMoviEnv` on the pairing.
+        """
         from src.rewards import combine, empty_info, smoothness_reward
 
         t = self._t
         smooth = smoothness_reward(
-            corrected_t["poses"].detach().cpu().numpy(),
-            self._prev_corrected["poses"].detach().cpu().numpy(),
-            self._prev2_corrected["poses"].detach().cpu().numpy(),
+            corrected_poses.detach().cpu().numpy(),
+            self._prev_poses.detach().cpu().numpy(),
+            self._prev2_poses.detach().cpu().numpy(),
         )
         if self._reproj_active:
-            r_proj, info = self._reproj.step(corrected_t, t, self._inner.trans_delta)
+            frame = {"poses": corrected_poses, "trans": corrected_trans}
+            r_proj, info = self._reproj.step(frame, t, self._inner.trans_delta)
         else:
             r_proj, info = float("nan"), empty_info()
 
@@ -414,6 +523,7 @@ def rollout_policy(
     max_steps:     int | None = None,
     deterministic: bool  = True,
     trans_mode:    str   = TRANS_MODE_NONE,
+    state_trans:   bool  = True,
 ) -> list:
     """
     Roll a policy over one clip and return the corrected poses, `(52, 3)` each,
@@ -429,6 +539,11 @@ def rollout_policy(
     `reproj_reward` is required when `use_evidence` is set: the evidence *is* the
     reward's own projection of the lifted pose. Rolling out without it is only
     correct for a policy trained without it.
+
+    `state_trans` must match how the policy was trained, for the same reason:
+    312 dims versus 318 is a shape mismatch that torch *will* catch, but 356
+    versus 362 with evidence is equally wrong and equally silent if the caller
+    guesses. `evaluate.py` reads it out of the checkpoint config.
     """
     from src.rewards import empty_evidence, pack_evidence
 
@@ -447,9 +562,13 @@ def rollout_policy(
     active = bool(reproj_reward.reset(sample)) if use_evidence else False
     lo, hi = action_bounds(trans_mode)
     act_low, act_high = torch.from_numpy(lo), torch.from_numpy(hi)
-    inner  = MoviEnv(device=device)
+    inner  = MoviEnv(device=device) if state_trans else NoTransMoviEnv(device=device)
     state  = inner.reset({k: x[k][0] for k in keys})
     dev    = torch.device(device)
+
+    def corrected_poses():
+        c = state["corrected_state"]
+        return c if isinstance(c, torch.Tensor) else c["poses"]
 
     def observe(t):
         evidence = None
@@ -474,5 +593,5 @@ def rollout_policy(
             action, _ = actor.act(obs)
         action = torch.max(torch.min(action.cpu(), act_high), act_low)
         state = inner.step(unflatten_action(action), {k: x[k][t + 1] for k in keys})
-        corrected.append(state["corrected_state"]["poses"].cpu())
+        corrected.append(corrected_poses().cpu())
     return corrected

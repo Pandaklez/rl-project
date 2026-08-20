@@ -174,7 +174,16 @@ class Config:
     reward_mode:  str   = "gt"
     reproj_path:  str   = "data/reproj_targets.h5"
     w_reproj:     float = 1.0
-    reproj_sigma: float = 0.04
+    # Retuned after the keypoint-bias correction. `exp(-e^2/s^2)` is steepest at
+    # e = s/sqrt(2), so sigma should sit at operating_point * sqrt(2). Removing
+    # the systematic COCO<->SMPL-X offset drops the held-out operating point from
+    # 0.0306 to 0.0159 bbox heights (14.2 -> 7.4 px), so sigma follows it down
+    # from 0.043 to 0.0225. Leaving it at 0.04 would put the reward in its
+    # saturated corner, where there is almost no gradient.
+    reproj_sigma: float = 0.0225
+    # Per-joint COCO<->SMPL-X offset, fitted by scripts/fit_kp_bias.py on train.
+    # "" disables the correction (ablation).
+    kp_bias_path: str = "data/kp_bias.json"
     # How often the lifted-vs-corrected comparison is *logged*. The projection
     # itself now happens every frame regardless, because the observation needs it
     # (fix 06), so this no longer buys any compute back.
@@ -183,6 +192,12 @@ class Config:
     reward_baseline: bool = True
     # Fix 06: put the reward's own 2D residual into the observation.
     use_evidence: bool = True
+    # Whether `trans` is in the observation. The lifted `trans` is virtual-camera
+    # depth, not metres, and is never corrected — so with this off the state is
+    # poses only and the translation is kept inside the env for the reprojection
+    # reward alone. This is the third variant of experiment (B), reported
+    # alongside trans_mode none/uv.
+    state_trans: bool = True
 
     # Translation (§2). The lifted `trans` is virtual-camera depth, not metres,
     # so it is never corrected as a normalised delta — it is passed through, and
@@ -240,6 +255,7 @@ def train(cfg: Config) -> None:
         from src.rewards import ReprojectionReward, load_calib
         reproj_reward = ReprojectionReward(
             load_calib(cfg.h5_path), sigma=cfg.reproj_sigma,
+            bias=cfg.kp_bias_path or None,
             # Under pose-only training the policy never moves `trans`, so there
             # is nothing to re-derive: use the metric translation already in the
             # sidecar, which is the path the 11.6 / 14.5 px validation measured.
@@ -247,7 +263,9 @@ def train(cfg: Config) -> None:
             # translation directly, so the virtual-camera path stays off.
             correct_translation=False,
         )
-        print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT")
+        print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT"
+              + (f", keypoint bias from {cfg.kp_bias_path}" if cfg.kp_bias_path
+                 else ", NO keypoint-bias correction"))
     else:
         print("Reward: GT similarity + smoothness (supervised; ablation only)")
 
@@ -264,6 +282,7 @@ def train(cfg: Config) -> None:
         trans_mode=cfg.trans_mode,
         reward_baseline=cfg.reward_baseline,
         use_evidence=cfg.use_evidence,
+        state_trans=cfg.state_trans,
     )
     _TRANS_DESC = {"none": "poses only, translation frozen",
                    "uv":   "poses + du,dv image shift (log-depth frozen)",
@@ -271,8 +290,9 @@ def train(cfg: Config) -> None:
     print(f"Action: {gym_env.action_space.shape[0]}-d ({_TRANS_DESC[cfg.trans_mode]}), "
           f"pose delta bounded to +-{gym_env.action_space.high[0]:g}")
     print(f"Observation: {gym_env.observation_space.shape[0]}-d "
-          + ("(pose + 2D evidence: residual, confidence, error, progress, camera)"
-             if gym_env.use_evidence else "(pose only — the reward is NOT observable)"))
+          + ("poses" if not gym_env.state_trans else "poses + trans")
+          + (" + 2D evidence (residual, confidence, error, progress, camera)"
+             if gym_env.use_evidence else "  — the reward is NOT observable"))
     if gym_env.reward_mode == "reproj":
         print("Reward: " + ("improvement over the lifted pose (baselined)"
                             if gym_env.reward_baseline else "absolute level (no baseline)"))
@@ -369,10 +389,12 @@ def train(cfg: Config) -> None:
                     # the trainer's is bound to whatever the rollout is on.
                     reproj_reward=ReprojectionReward(
                         load_calib(cfg.h5_path), sigma=cfg.reproj_sigma,
+            bias=cfg.kp_bias_path or None,
                         correct_translation=False,
                     ),
                     use_evidence=gym_env.use_evidence,
                     trans_mode=cfg.trans_mode,
+                    state_trans=cfg.state_trans,
                 )
                 kind = f"image-plane on video ({len(viz_logger.clips)} clips)"
             else:
@@ -456,7 +478,12 @@ def main() -> None:
                         help="'reproj' is the GT-free reward for experiments (B)/(C)")
     parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
     parser.add_argument("--w_reproj",            type=float, default=1.0)
-    parser.add_argument("--reproj_sigma",        type=float, default=0.04)
+    parser.add_argument("--reproj_sigma",        type=float, default=0.0225,
+                        help="reward width in bbox-height units; tuned to the "
+                             "bias-corrected operating point (see Config)")
+    parser.add_argument("--kp_bias_path",        default="data/kp_bias.json",
+                        help="per-joint COCO<->SMPL-X offset from "
+                             "scripts.fit_kp_bias; empty string disables it")
     parser.add_argument("--trans_mode", choices=("none", "uv", "uvz"), default="none",
                         help="translation action. 'none' (156-d) freezes it. 'uv' "
                              "(158-d) lets the policy shift the body in the image "
@@ -472,6 +499,12 @@ def main() -> None:
                              "improvement over the lifted pose. Off by default "
                              "because the absolute level is ~0.68 of constant the "
                              "policy cannot influence.")
+    parser.add_argument("--no_state_trans",      dest="state_trans",
+                        action="store_false",
+                        help="drop `trans` from the observation, leaving a "
+                             "poses-only state (312-d, or 356-d with evidence). "
+                             "The translation stays inside the env and is still "
+                             "used by the reprojection reward.")
     parser.add_argument("--no_evidence",         dest="use_evidence",
                         action="store_false",
                         help="drop the 2D residual block from the observation, "

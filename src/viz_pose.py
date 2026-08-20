@@ -268,7 +268,7 @@ class ImagePoseVizLogger:
     def __init__(self, dataset, actor, gt_stats, calib, reproj_path,
                  video_root="demo/videos", device="cpu", n_clips=3, n_frames=4,
                  max_steps=120, seed=0, reproj_reward=None, use_evidence=False,
-                 trans_mode="none"):
+                 trans_mode="none", state_trans=True):
         import h5py
 
         self.dataset = dataset
@@ -285,6 +285,7 @@ class ImagePoseVizLogger:
         self.reproj_reward = reproj_reward
         self.use_evidence = bool(use_evidence) and reproj_reward is not None
         self.trans_mode = trans_mode
+        self.state_trans = bool(state_trans)
         video_root = Path(video_root)
 
         # Pick clips once, at construction, so every figure shows the same ones.
@@ -359,7 +360,8 @@ class ImagePoseVizLogger:
         corr = [c.numpy() for c in rollout_policy(
             sample, self.actor, keys=keys, device=str(self.device),
             reproj_reward=self.reproj_reward, use_evidence=self.use_evidence,
-            max_steps=self.max_steps, trans_mode=self.trans_mode)]
+            max_steps=self.max_steps, trans_mode=self.trans_mode,
+            state_trans=self.state_trans)]
 
         # Sample frames evenly, but only from frames that carry 2D evidence —
         # a panel with no detection would have nothing to compare against.

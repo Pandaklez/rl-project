@@ -36,8 +36,20 @@ class TestIntrinsics:
         fx, fy, cx, cy = real_intrinsics(K_MATLAB)
         assert fx == pytest.approx(979.17889011)
         assert fy == pytest.approx(978.10179305)
-        # principal point comes from the bottom row, not the right column
-        assert (cx, cy) == pytest.approx((408.02731030, 291.16967878))
+        # Principal point comes from the bottom row, not the right column
+        # (MATLAB stores K transposed) — and shifted by one pixel, because
+        # MATLAB reports it 1-based while numpy indexes from 0. Without the
+        # shift every projected point lands 1 px right and 1 px down.
+        assert (cx, cy) == pytest.approx((407.02731030, 290.16967878))
+
+    def test_principal_point_is_not_left_in_matlab_1_based_coordinates(self):
+        """The one-pixel shift is invisible by inspection, so pin it."""
+        from src.reproject import MATLAB_PIXEL_ORIGIN
+
+        _, _, cx, cy = real_intrinsics(K_MATLAB)
+        assert (cx, cy) == pytest.approx(
+            (K_MATLAB[2, 0] - MATLAB_PIXEL_ORIGIN, K_MATLAB[2, 1] - MATLAB_PIXEL_ORIGIN))
+        assert MATLAB_PIXEL_ORIGIN == 1.0
 
     def test_rejects_wrong_shape(self):
         with pytest.raises(ValueError):
