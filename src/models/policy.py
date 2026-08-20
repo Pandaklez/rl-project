@@ -245,6 +245,33 @@ def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.
     return torch.cat(parts, dim=-1)
 
 
+def extract_corrected_pose(state: torch.Tensor, state_trans: bool = True) -> torch.Tensor:
+    """
+    Slice the corrected-pose block back out of a flat observation built by
+    `flatten_state`.
+
+    `flatten_state`'s layout is fixed regardless of `use_evidence` (the
+    evidence block, if any, is appended last), so only `state_trans` — whether
+    `trans` occupies the two 3-wide gaps — moves the offset:
+
+        state_trans=True:   [lifted(156), lifted_trans(3), corrected(156), corrected_trans(3), ...]
+        state_trans=False:  [lifted(156), corrected(156), ...]
+
+    Exists so the GAIL discriminator (`src/gail_train.py::PPOWithGAIL`) can
+    read the policy's corrected-pose transitions straight out of skrl's
+    on-policy memory instead of re-deriving them from the env: row t of the
+    stored `states` tensor carries corrected_{t-1}, row t+1 carries
+    corrected_t (skrl stores one observation per step, not a parallel
+    "next state" tensor — see `PPOWithGAIL._update_discriminator` for the
+    episode-boundary masking consecutive-row pairing needs). One definition
+    here rather than duplicating the offset arithmetic at the call site keeps
+    it from drifting out of sync with `flatten_state` the way `state_dim` is
+    kept in sync everywhere else.
+    """
+    off = POSE_DIM + (TRANS_DIM if state_trans else 0)
+    return state[..., off:off + POSE_DIM]
+
+
 def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
     """
     Split a flat action vector into the parts `MoviEnv.step` consumes.
