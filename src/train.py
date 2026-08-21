@@ -152,7 +152,7 @@ class Config:
     #
     # **Not skrl's default 0.008.** For two Gaussians with a shared sigma the KL
     # is `(D/2)·(dmu/sigma)²`, so the trust region a threshold buys depends on
-    # the action dimension and on sigma — and this policy is extreme in both: 156
+    # the action dimension and on sigma — and this policy is extreme in both: 66
     # dims and sigma = 0.05, twenty times smaller than a typical continuous-
     # control policy because the action is a residual around an already-good
     # pose. At 0.008 one update may move the mean by 1.0% of sigma, which is
@@ -160,8 +160,11 @@ class Config:
     # floors the learning rate at skrl's min_lr of 1e-6 within three updates and
     # learning stops.
     #
-    # 0.05 corresponds to 2.5% of sigma per update — still a tight trust region,
-    # but one an Adam step at 1e-4 can actually stay inside.
+    # 0.05 corresponds to 3.9% of sigma per update at the current 66 action dims
+    # — still a tight trust region, but one an Adam step at 1e-4 can actually stay
+    # inside. It was 2.5% at the old 156 dims: the same threshold buys a slightly
+    # wider step now, because the KL scales with D and the pose vector lost its
+    # 90 finger dimensions.
     kl_threshold:       float = 0.05
 
     # Reward weights
@@ -472,7 +475,7 @@ def main() -> None:
     parser.add_argument("--grad_norm_clip",      type=float, default=0.5)
     parser.add_argument("--kl_threshold",        type=float, default=0.05,
                         help="target KL for the adaptive learning-rate scheduler "
-                             "(0 disables it). Not skrl's 0.008: at 156 action "
+                             "(0 disables it). Not skrl's 0.008: at 66 action "
                              "dims and sigma=0.05 that allows a mean step of 1%% "
                              "of sigma and floors the learning rate in three "
                              "updates. See Config.kl_threshold.")
@@ -490,7 +493,7 @@ def main() -> None:
                         help="per-joint COCO<->SMPL-X offset from "
                              "scripts.fit_kp_bias; empty string disables it")
     parser.add_argument("--trans_mode", choices=("none", "uv", "uvz"), default="none",
-                        help="translation action. 'none' (156-d) freezes it. 'uv' "
+                        help="translation action. 'none' (66-d) freezes it. 'uv' "
                              "(158-d) lets the policy shift the body in the image "
                              "plane in bbox-height units — the coordinates the "
                              "reprojection reward is actually sensitive in — with "

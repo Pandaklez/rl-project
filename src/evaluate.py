@@ -296,8 +296,10 @@ def eval_model(
 
         lifted_stats = dict(load_lifted_stats(camera))
         l_mu, l_sigma = lifted_stats["poses"]
-        corr = corr_n * torch.as_tensor(l_sigma).reshape(52, 3) \
-                      + torch.as_tensor(l_mu).reshape(52, 3)
+        # -1, not a joint-count literal: the dataset dropped the 30 finger joints
+        # (52 -> 22) and a hard-coded 52 here would raise on the new stats.
+        corr = corr_n * torch.as_tensor(l_sigma).reshape(-1, 3) \
+                      + torch.as_tensor(l_mu).reshape(-1, 3)
         gt   = unnormalize_t(gt_n, "poses", norm_stats)
 
         gt_betas = unnormalize_t(y["betas"].cpu(), "betas", norm_stats)
@@ -386,7 +388,7 @@ def main() -> None:
         cfg    = ckpt["config"]
 
         # The action width is a property of the checkpoint, not of the current
-        # default: 156 for a pose-only policy, 159 for one that also corrected
+        # default: 66 for a pose-only policy, 69 for one that also corrected
         # `trans`. Reading it back means checkpoints from either regime load.
         act_dim  = ckpt["actor"]["log_std"].shape[0]
         trans_mode = trans_mode_from_width(act_dim)

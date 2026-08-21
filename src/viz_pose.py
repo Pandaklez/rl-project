@@ -78,8 +78,8 @@ def unnormalize(arr: torch.Tensor, key: str, stats: dict) -> torch.Tensor:
 
 
 def _unscale_seq(seq: torch.Tensor, stats) -> torch.Tensor:
-    """Unnormalise a (T, 52, 3) pose sequence with per-camera lifted stats."""
-    # The stats are stored per joint as (52, 3), which broadcasts over T as-is.
+    """Unnormalise a (T, 22, 3) pose sequence with per-camera lifted stats."""
+    # The stats are stored per joint as (22, 3), which broadcasts over T as-is.
     return torch.from_numpy(unscale(seq.numpy(), "poses", stats))
 
 
@@ -114,7 +114,7 @@ class PoseVizLogger:
 
     @torch.no_grad()
     def _rollout(self, idx):
-        """Return (lifted, corrected, gt) unnormalized pose sequences, (T, 52, 3)."""
+        """Return (lifted, corrected, gt) unnormalized pose sequences, (T, 22, 3)."""
         sample = self.dataset[idx]
         x, y = sample["x"], sample["y"]
         keys = ("poses", "trans")
@@ -333,7 +333,7 @@ class ImagePoseVizLogger:
     # ── projection ───────────────────────────────────────────────────────────
     def _project(self, poses_norm, betas, stats, camera, trans_metric):
         """One normalised frame -> (22, 2) image-plane joints."""
-        poses = unscale(poses_norm.reshape(52, 3), "poses", stats)
+        poses = unscale(poses_norm.reshape(-1, 3), "poses", stats)
         poses_cam = uncorrect_root(poses[None], camera)
         joints = joints_from_poses(poses_cam, betas, device=str(self.device)).numpy()
         placed = place_in_camera(joints, trans_metric[None])

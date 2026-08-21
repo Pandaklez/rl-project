@@ -69,8 +69,13 @@ import torch.nn.functional as F
 
 from src.data.datasets import gt_group
 
-N_JOINTS = 52
-POSE_DIM = N_JOINTS * 3   # 156
+# Body joints only. The 30 finger joints are gone from the data
+# (data/norm_upsample.py): MoVi has no finger mocap, so in GT they normalised to
+# exactly +/-1 while SMPLer-X's genuine finger predictions never did, which let a
+# discriminator separate real from fake at 100% by reading 90 dimensions that
+# contain no motion at all.
+N_JOINTS = 22
+POSE_DIM = N_JOINTS * 3   # 66
 WINDOW = 1                # frames per discriminator input; see module docstring
 
 
@@ -129,7 +134,7 @@ class MotionDiscriminator(nn.Module):
 
 def make_window(*poses: torch.Tensor) -> torch.Tensor:
     """
-    Concatenate one or more `(..., 52, 3)` (or already-flat `(..., 156)`)
+    Concatenate one or more `(..., 22, 3)` (or already-flat `(..., 66)`)
     pose tensors into one `(..., WINDOW*POSE_DIM)` discriminator input,
     oldest first. With `WINDOW=1` this is called with a single pose and is
     just a flatten; kept general so a wider window is a one-line call-site

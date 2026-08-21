@@ -214,7 +214,7 @@ class ReprojectionReward:
     # ── per-frame reward ─────────────────────────────────────────────────────
     def step(self, corrected: dict, t: int, trans_delta=None) -> tuple[float, dict]:
         """
-        corrected : {"poses": (52,3), "trans": (3,)} normalised, as the policy
+        corrected : {"poses": (22,3), "trans": (3,)} normalised, as the policy
                     emits them (world-frame root)
         t         : frame index into the clip
 
@@ -312,13 +312,13 @@ class ReprojectionReward:
         from src.smplx_fk import joints_from_poses
 
         c = self._clip
-        poses = unscale(_np(corrected["poses"]).reshape(52, 3), "poses", c["stats"])
+        poses = unscale(_np(corrected["poses"]).reshape(-1, 3), "poses", c["stats"])
         # A diverged policy reaches here with inf or nan and `Rotation.from_rotvec`
         # raises "Found zero norm quaternions", killing the run hours in. Report
         # it as a miss and let the caller end the episode instead.
         if not np.isfinite(poses).all():
             return None
-        poses_cam = uncorrect_root(poses[None], c["camera"])           # (1, 52, 3)
+        poses_cam = uncorrect_root(poses[None], c["camera"])           # (1, 22, 3)
 
         if self.correct_translation:
             transl = unscale(_np(corrected["trans"]).reshape(1, 3), "trans", c["stats"])

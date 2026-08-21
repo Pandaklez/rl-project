@@ -7,12 +7,17 @@ import torch.nn as nn
 from torch.distributions import Normal
 from skrl.models.torch import Model, GaussianMixin, DeterministicMixin
 
-N_JOINTS  = 52
-POSE_DIM  = N_JOINTS * 3   # 156
+# 22 SMPL-X body joints (0 global orient, 1-21 body). Joints 22-51 are the two
+# hands and are dropped in data/norm_upsample.py -- MoVi has no finger mocap, so
+# in GT they are a constant that normalises to exactly +/-1 and acts as a
+# "GT or lifted" label for the discriminator, while contributing 91.6% of the
+# smoothness reward's acceleration energy and nothing to any metric.
+N_JOINTS  = 22
+POSE_DIM  = N_JOINTS * 3   # 66
 TRANS_DIM = 3
 BETAS_DIM = 16
 FRAME_DIM = POSE_DIM + TRANS_DIM        # 159 — one frame of poses + trans
-STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1}
+STATE_DIM = 2 * FRAME_DIM               # 138 — lifted_t concat corrected_{t-1}
 
 # ...and the same state without translation. The lifted `trans` is SMPLer-X's
 # virtual-camera depth, not metres, so it is not a quantity the policy can
@@ -21,8 +26,8 @@ STATE_DIM = 2 * FRAME_DIM               # 318 — lifted_t concat corrected_{t-1
 # the state only offers the network 3 numbers whose units it has no way to
 # learn. `state_trans=False` removes it; the value is still kept inside the env
 # and handed to the reprojection reward, which *does* need it.
-FRAME_DIM_NO_TRANS = POSE_DIM           # 156
-STATE_DIM_NO_TRANS = 2 * FRAME_DIM_NO_TRANS   # 312
+FRAME_DIM_NO_TRANS = POSE_DIM           # 66
+STATE_DIM_NO_TRANS = 2 * FRAME_DIM_NO_TRANS   # 132
 
 # Width of the 2D-evidence block (src/rewards.py owns the layout). Imported by
 # value rather than re-derived so the two cannot drift apart.
@@ -73,12 +78,12 @@ ACTION_LIMIT = 0.3
 # regress a quantity whose units it cannot see, and PA-MPJPE is Procrustes-
 # aligned so the metric never depended on it either.
 #
-# Pose-only is therefore the default: 156 dims, no trans delta. `trans` stays in
+# Pose-only is therefore the default: 66 dims, no trans delta. `trans` stays in
 # the observation, because apparent size in the image is genuine information
 # about depth even when the number is not metric.
-ACTION_DIM_POSE_ONLY  = POSE_DIM        # 156 — poses only (default)
-ACTION_DIM_UV         = POSE_DIM + 2    # 158 — poses + image-plane shift
-ACTION_DIM_WITH_TRANS = POSE_DIM + 3    # 159 — poses + shift + log-depth
+ACTION_DIM_POSE_ONLY  = POSE_DIM        # 66 — poses only (default)
+ACTION_DIM_UV         = POSE_DIM + 2    # 68 — poses + image-plane shift
+ACTION_DIM_WITH_TRANS = POSE_DIM + 3    # 69 — poses + shift + log-depth
 
 # ── Translation action: reparameterised into what the reward can actually see ─
 #
@@ -200,9 +205,9 @@ def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.
     Convert the env state dict to a flat tensor suitable for the policy.
 
     Expected state structure (from MoviEnv):
-        state["lifted_state"]["poses"]    (..., 52, 3)
+        state["lifted_state"]["poses"]    (..., 22, 3)
         state["lifted_state"]["trans"]    (..., 3)
-        state["corrected_state"]["poses"] (..., 52, 3)
+        state["corrected_state"]["poses"] (..., 22, 3)
         state["corrected_state"]["trans"] (..., 3)
 
     Accepts either state shape. `MoviEnv` stores each slot as a
@@ -224,14 +229,14 @@ def flatten_state(state: dict, use_betas: bool = False, evidence=None) -> torch.
     lifted    = state["lifted_state"]
     corrected = state["corrected_state"]
     if isinstance(lifted, torch.Tensor):
-        # Pose-only state (NoTransMoviEnv): the two slots are (..., 52, 3)
+        # Pose-only state (NoTransMoviEnv): the two slots are (..., 22, 3)
         # tensors rather than dicts, because there is no second key to hold.
         parts = [lifted.flatten(-2), corrected.flatten(-2)]
     else:
         parts = [
-            lifted["poses"].flatten(-2),      # (..., 156)
+            lifted["poses"].flatten(-2),      # (..., 66)
             lifted["trans"],                   # (..., 3)
-            corrected["poses"].flatten(-2),    # (..., 156)
+            corrected["poses"].flatten(-2),    # (..., 66)
             corrected["trans"],                # (..., 3)
         ]
     if use_betas:
@@ -254,8 +259,8 @@ def extract_corrected_pose(state: torch.Tensor, state_trans: bool = True) -> tor
     evidence block, if any, is appended last), so only `state_trans` — whether
     `trans` occupies the two 3-wide gaps — moves the offset:
 
-        state_trans=True:   [lifted(156), lifted_trans(3), corrected(156), corrected_trans(3), ...]
-        state_trans=False:  [lifted(156), corrected(156), ...]
+        state_trans=True:   [lifted(66), lifted_trans(3), corrected(66), corrected_trans(3), ...]
+        state_trans=False:  [lifted(66), corrected(66), ...]
 
     Exists so the GAIL discriminator (`src/gail_train.py::PPOWithGAIL`) can
     read the policy's corrected poses straight out of skrl's on-policy memory
@@ -281,11 +286,11 @@ def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:
     Which layout it is follows from the width itself rather than from a flag the
     caller has to keep in sync:
 
-        (..., 156)  poses only            -> trans_delta is exactly zero
+        (..., 66)  poses only            -> trans_delta is exactly zero
         (..., 158)  poses + du, dv        -> dlog_tz is exactly zero (frozen)
         (..., 159)  poses + du, dv, dlog  -> all three free (ablation)
 
-    Returns `{"poses": (..., 52, 3), "trans_delta": (..., 3)}`.
+    Returns `{"poses": (..., 22, 3), "trans_delta": (..., 3)}`.
 
     `trans_delta` is **not** a delta on the lifted `trans`. It is
     `(du, dv, dlog_tz)`: an image-plane shift in bbox-height units and a

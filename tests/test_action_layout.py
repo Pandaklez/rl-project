@@ -38,9 +38,9 @@ def _frame(seed: int = 0) -> dict:
 # ── widths ───────────────────────────────────────────────────────────────────
 
 def test_action_dim_per_trans_mode():
-    assert action_dim() == action_dim("none") == ACTION_DIM_POSE_ONLY == 156
-    assert action_dim("uv") == ACTION_DIM_UV == 158
-    assert action_dim("uvz") == ACTION_DIM_WITH_TRANS == 159
+    assert action_dim() == action_dim("none") == ACTION_DIM_POSE_ONLY == 66
+    assert action_dim("uv") == ACTION_DIM_UV == 68
+    assert action_dim("uvz") == ACTION_DIM_WITH_TRANS == 69
 
 
 def test_width_and_mode_round_trip():
@@ -168,7 +168,7 @@ def test_actor_head_width_and_state_dict_round_trip(trans_mode):
     expected = action_dim(trans_mode)
     assert actor.log_std.shape == (expected,)
 
-    out, _ = actor.act(torch.zeros(2, 318))
+    out, _ = actor.act(torch.zeros(2, 138))
     assert out.shape == (2, expected)
 
     # evaluate.py infers the mode from log_std's width; check that inference is

@@ -12,8 +12,14 @@ Pose layout matches the HDF5 files written by scripts/movi_smplx_processing.py:
 
     poses[:,  0    ] -> global_orient   (3,)
     poses[:,  1:22 ] -> body_pose       (21, 3)
-    poses[:, 22:37 ] -> left_hand_pose  (15, 3)
-    poses[:, 37:52 ] -> right_hand_pose (15, 3)
+    poses[:, 22:37 ] -> left_hand_pose  (15, 3)   optional
+    poses[:, 37:52 ] -> right_hand_pose (15, 3)   optional
+
+A 22-joint pose is also accepted, which is what data/processed_movi.h5 now
+stores: the hand joints are zero-filled. That changes nothing measurable here --
+this function returns body joints, and fingers are leaves of the kinematic tree,
+so no finger pose can move joints 0-21. Verified: randomising all 30 finger
+joints moves the output by 0.000e+00 m.
 
 Translation is deliberately zeroed: PA-MPJPE Procrustes-aligns before measuring,
 so global position cancels anyway, and the lifted `trans` is virtual-camera depth
@@ -64,7 +70,7 @@ def joints_from_poses(
     """
     Run SMPL-X forward and return joint positions in metres.
 
-    poses : (T, 52, 3) axis-angle
+    poses : (T, 52, 3) or (T, 22, 3) axis-angle — hands zero-filled if absent
     betas : (16,) or (10,) shape coefficients, or None for the mean shape
     returns (T, n_joints, 3)
 
@@ -88,11 +94,16 @@ def joints_from_poses(
         n = p.shape[0]
         zeros = lambda d: torch.zeros(n, d, device=device)  # noqa: E731
 
+        # Hands: present in a 52-joint pose, zero for a 22-joint one.
+        has_hands = p.shape[1] >= 52
+        lh = p[:, 22:37].reshape(n, -1) if has_hands else zeros(45)
+        rh = p[:, 37:52].reshape(n, -1) if has_hands else zeros(45)
+
         out = model(
             global_orient   = p[:, 0],
             body_pose       = p[:, 1:22].reshape(n, -1),
-            left_hand_pose  = p[:, 22:37].reshape(n, -1),
-            right_hand_pose = p[:, 37:52].reshape(n, -1),
+            left_hand_pose  = lh,
+            right_hand_pose = rh,
             betas           = beta_vec.to(device).expand(n, -1),
             transl          = zeros(3),
             jaw_pose        = zeros(3),

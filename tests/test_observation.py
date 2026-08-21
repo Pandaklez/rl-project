@@ -2,7 +2,7 @@
 The observation carries what the reward is computed from.
 
 §4 of the failure analysis: the observation was `(lifted_t, corrected_{t-1})`,
-318 numbers of pose, while the reward was reprojection error against ViTPose
+138 numbers of pose, while the reward was reprojection error against ViTPose
 keypoints using this clip's camera, bbox and metric translation. None of that
 was observable, so the best policy the network could represent was the identity.
 
@@ -35,8 +35,8 @@ def test_evidence_layout_adds_up():
 
 def test_state_dim_tracks_the_flag():
     from src.models.policy import STATE_DIM, state_dim
-    assert state_dim(False) == STATE_DIM == 318
-    assert state_dim(True) == 318 + EVIDENCE_DIM == 362
+    assert state_dim(False) == STATE_DIM == 138
+    assert state_dim(True) == 138 + EVIDENCE_DIM == 182
 
 
 def test_empty_evidence_is_all_zero_but_carries_progress():
@@ -72,8 +72,8 @@ def test_flatten_state_appends_evidence_at_the_end():
     from src.models.policy import STATE_DIM, flatten_state
 
     state = {
-        "lifted_state":    {"poses": torch.zeros(52, 3), "trans": torch.zeros(3)},
-        "corrected_state": {"poses": torch.zeros(52, 3), "trans": torch.zeros(3)},
+        "lifted_state":    {"poses": torch.zeros(22, 3), "trans": torch.zeros(3)},
+        "corrected_state": {"poses": torch.zeros(22, 3), "trans": torch.zeros(3)},
     }
     ev = np.arange(EVIDENCE_DIM, dtype=np.float32)
     flat = flatten_state(state, evidence=ev)

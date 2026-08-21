@@ -20,7 +20,7 @@ needs_env = pytest.mark.skipif(
     importlib.util.find_spec("gymnasium") is None,
     reason="src.env imports gymnasium (smplerx env)")
 
-N_JOINTS, T = 52, 6
+N_JOINTS, T = 22, 6
 
 
 class _StubDataset:

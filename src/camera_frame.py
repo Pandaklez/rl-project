@@ -62,7 +62,7 @@ def correct_root(poses: np.ndarray, camera: str, calib_dir: str | None = None) -
     """
     Rotate the root joint of a lifted clip into the world frame.
 
-    poses : (T, 52, 3) axis-angle, joint 0 = root
+    poses : (T, J, 3) axis-angle, joint 0 = root (J = 22 after the finger removal)
     returns a copy with poses[:, 0] corrected; joints 1-51 are untouched
     because they are parent-relative and carry no camera offset.
     """
@@ -82,7 +82,7 @@ def uncorrect_root(poses: np.ndarray, camera: str, calib_dir: str | None = None)
     stored `root_cam`, which is the untouched lifted root rather than the
     policy's output.
 
-    poses : (T, 52, 3) axis-angle with a world-frame root
+    poses : (T, J, 3) axis-angle with a world-frame root
     """
     poses = np.asarray(poses, dtype=np.float32).copy()
     root = R.from_rotvec(poses[:, 0, :])

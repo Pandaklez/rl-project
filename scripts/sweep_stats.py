@@ -40,8 +40,6 @@ from pathlib import Path
 
 import numpy as np
 
-POSE_DIM = 156
-
 VARIANTS = {"frozen": "(B1) frozen", "uv": "(B2) du,dv", "notrans": "(B3) pose-only"}
 
 TAGS = {
@@ -211,7 +209,11 @@ def lifted_smoothness(h5_path: str, split: str = "train", sigma: float = 0.5) ->
             for cam in ("pg1", "pg2"):
                 if cam not in grp:
                     continue
-                p = grp[cam]["poses"][:].astype(np.float32).reshape(-1, POSE_DIM)
+                # Joint count comes from the file, not a constant: the dataset
+                # dropped the 30 finger joints (52 -> 22) and a stale constant
+                # here would reshape silently rather than raise.
+                p = grp[cam]["poses"][:].astype(np.float32).reshape(
+                    grp[cam]["poses"].shape[0], -1)
                 T = p.shape[0]
                 if T < 2:
                     continue

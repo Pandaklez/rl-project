@@ -127,8 +127,8 @@ class NoTransMoviEnv:
         """
         Apply the correction and advance to the next lifted frame.
 
-        action      : {"poses": (52, 3), "trans_delta": (3,)} from `unflatten_action`
-        next_lifted : {"poses": (52, 3), "trans": (3,)} — the clip at t+1
+        action      : {"poses": (22, 3), "trans_delta": (3,)} from `unflatten_action`
+        next_lifted : {"poses": (22, 3), "trans": (3,)} — the clip at t+1
         """
         self.state["corrected_state"] = (
             self.state["lifted_state"] + action["poses"].to(self.device))
@@ -526,7 +526,7 @@ def rollout_policy(
     state_trans:   bool  = True,
 ) -> list:
     """
-    Roll a policy over one clip and return the corrected poses, `(52, 3)` each,
+    Roll a policy over one clip and return the corrected poses, `(22, 3)` each,
     still normalised.
 
     **This exists so that training, `src/viz_pose.py` and `src/evaluate.py`

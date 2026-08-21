@@ -146,10 +146,10 @@ def test_initial_sigma_is_per_dimension():
 
 
 def test_pose_only_sigma_is_unchanged():
-    """The 156-d policy must be bit-identical to before — the per-dim vector
+    """The 66-d policy must be bit-identical to before — the per-dim vector
     only differs where translation dims exist."""
     from src.models.policy import INIT_LOG_STD, init_log_std_vector
 
     v = init_log_std_vector("none")
-    assert v.shape == (156,)
+    assert v.shape == (66,)
     assert (v == INIT_LOG_STD).all()

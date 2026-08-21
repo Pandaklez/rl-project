@@ -11,6 +11,33 @@ from src.camera_frame import correct_root  # noqa: E402
 
 FRAMERATE = 120  # Hz — fixed for MoVi
 
+# SMPL-X stores 52 joints: 0 global orient, 1-21 body, 22-51 the two hands.
+# Only the first 22 are kept.
+#
+# MoVi has no finger mocap, so GT joints 22-51 hold one constant canonical hand
+# pose in every frame of every clip. Normalising a constant dimension divides
+# float noise by its own standard deviation (~1e-12 here, which the `sigma == 0`
+# guard below does not catch) and maps it to exactly +/-1 — while SMPLer-X does
+# predict fingers, so the lifted values are genuine. That turns 90 of 156 pose
+# dimensions into a perfect "GT or lifted" label, which a motion discriminator
+# reads instead of learning anything about pose.
+#
+# Nothing downstream wants them either: SMPL-X forward kinematics returns 22 body
+# joints and they are unaffected by finger pose (fingers are leaves of the
+# kinematic tree), ViTPose is COCO-17 and has no finger keypoints, and PA-MPJPE
+# is measured over 22 joints or fewer. Their only other effect was on the
+# smoothness reward, which averages squared acceleration over every dimension it
+# is given -- and 91.6% of that energy was finger jitter.
+N_JOINTS = 22
+
+
+def _crop_joints(arr, n_joints=N_JOINTS):
+    """Keep the first `n_joints` of a (T, J, 3) pose array; pass anything else through."""
+    a = np.asarray(arr)
+    if a.ndim == 3 and a.shape[1] > n_joints:
+        return a[:, :n_joints, :]
+    return a
+
 
 def normalize_clip(clip, clip_name, norm_stats):
     normalized = {}
@@ -20,7 +47,10 @@ def normalize_clip(clip, clip_name, norm_stats):
         mu = np.array(norm_stats[key]["mu"])
         sigma = np.array(norm_stats[key]["sigma"])
         sigma = np.where(sigma == 0, 1.0, sigma)  # avoid division by zero for constant dims
-        normalized[key] = (clip[key][:] - mu) / sigma
+        value = clip[key][:]
+        if key == "poses":
+            value = _crop_joints(value)
+        normalized[key] = (value - mu) / sigma
     return normalized
 
 
@@ -91,6 +121,10 @@ def create_normalization(data_file, norm_out_file, camera=None, correct=False, c
             else:
                 ex = data_file["train"][key]
             arr = ex[ds][:]
+            if ds == "poses":
+                # Crop before the stats, not after: mu/sigma must describe the
+                # same vector the clips are normalised against.
+                arr = _crop_joints(arr)
             if correct and camera and ds == "poses":
                 arr = correct_root(arr, camera, calib_dir)
             raw_data.append(arr)
@@ -104,16 +138,32 @@ def create_normalization(data_file, norm_out_file, camera=None, correct=False, c
             "sigma" : np_data.std(axis=0).tolist()
         }
     stats["_root_corrected"] = bool(correct and camera)
+    # Guard against a stale 52-joint stats file being used against 22-joint
+    # poses: the shapes broadcast in some directions and would corrupt silently.
+    stats["_n_joints"] = N_JOINTS
     with open(norm_out_file,"w") as dump_file:
         json.dump(stats,dump_file)
 
 
-def norm_is_stale(path, want_corrected):
-    """True if an existing norm file was built under a different correction setting."""
+def norm_is_stale(path, want_corrected, want_joints=N_JOINTS):
+    """
+    True if an existing norm file describes a different vector than the one we
+    are about to normalise against.
+
+    Two ways it can disagree. The root correction changes joint 0's *values*, and
+    a mismatch there is silent -- the shapes still line up and the pose comes out
+    plausible but wrong. The joint count changes the vector's *length*; that one
+    raises on the broadcast, but catching it here regenerates the stats instead
+    of failing a training run an hour in.
+
+    Files written before `_n_joints` existed are 52-joint by definition.
+    """
     if not os.path.exists(path):
         return False
     with open(path) as f:
-        return bool(json.load(f).get("_root_corrected", False)) != bool(want_corrected)
+        stats = json.load(f)
+    return (bool(stats.get("_root_corrected", False)) != bool(want_corrected)
+            or int(stats.get("_n_joints", 52)) != int(want_joints))
 
 
 def main():
@@ -162,12 +212,18 @@ def main():
     pg1_norm_path = os.path.join(os.getcwd(),args.pg1_norm_path)
     pg2_norm_path = os.path.join(os.getcwd(),args.pg2_norm_path)
 
+    # GT is never root-corrected (it is already world-frame), but it is subject
+    # to the joint-count check, so it goes through the same staleness gate.
+    if norm_is_stale(gt_norm_path, False):
+        print(f"  {os.path.basename(gt_norm_path)} describes a different pose "
+              f"vector, regenerating")
+        os.remove(gt_norm_path)
     if not os.path.exists(gt_norm_path):
         create_normalization(movi_h5,gt_norm_path)
     for path, cam in ((pg1_norm_path, "PG1"), (pg2_norm_path, "PG2")):
         if norm_is_stale(path, correct):
-            print(f"  {os.path.basename(path)} was built with root_corrected="
-                  f"{not correct}, regenerating")
+            print(f"  {os.path.basename(path)} describes a different pose vector "
+                  f"(root_corrected or joint count), regenerating")
             os.remove(path)
         if not os.path.exists(path):
             create_normalization(lifted_h5, path, cam, correct, args.calib_dir)
@@ -179,7 +235,8 @@ def main():
 
     out_file.attrs["description"] = "MoVi — normalized GT + lifted poses per action clip"
     out_file.attrs["framerate"]   = FRAMERATE
-    out_file.attrs["n_joints"]    = 52
+    # Body joints only; the 30 finger joints are cropped above. Was hard-coded 52.
+    out_file.attrs["n_joints"]    = N_JOINTS
     out_file.attrs["root_corrected"] = correct
     out_file.attrs["root_note"] = (
         "lifted poses[:,0] is world-frame when root_corrected; the untouched "

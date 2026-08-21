@@ -17,6 +17,63 @@ lists what changed and how to reproduce it.
 | `gt/` subgroup layout | Kept. Restructuring moves links only — array values verified byte-identical |
 | Splits | Subject-disjoint: 68 / 9 / 9 subjects, no overlap |
 
+### Pose vector: 52 → 22 joints (fingers removed)
+
+`data/processed_movi.h5` now stores **22 body joints (66 dims)** instead of 52
+(156). The 30 finger joints are cropped in `data/norm_upsample.py`, before the
+normalisation statistics are computed.
+
+**Why.** MoVi has no finger mocap, so GT joints 22–51 hold one constant canonical
+hand pose in every frame of every clip — per-dim std 9.7e-16, i.e. float noise.
+`create_normalization` therefore produced sigma ≈ 3.4e-12 for those dims, and
+`normalize_clip`'s divide-by-zero guard only catches sigma **exactly** 0, so it
+divided noise by its own standard deviation and mapped it to exactly ±1. SMPLer-X
+*does* predict fingers, so the lifted values are genuine and never land on ±1.
+
+The result was that 90 of 156 pose dimensions carried a perfect "GT or lifted"
+label. Measured on the old file: the rule *"are all 90 hand dims exactly ±1?"*
+separated real from fake at **100.0%** (1.000000 of GT rows, 0.000000 of lifted).
+A motion discriminator reads that instead of learning anything about pose, which
+made experiment (C)'s reward meaningless before it was ever run.
+
+**It also distorted (B).** `smoothness_reward` averages squared acceleration over
+every dimension it is handed. Measured over 95k frames of lifted trajectory,
+**91.6%** of that energy came from the finger dims — so most of what (B) was
+scored on for "smoothness" was finger jitter that no other reward term saw and no
+metric measured.
+
+**Nothing downstream wanted them.** SMPL-X forward kinematics
+(`src/smplx_fk.joints_from_poses`) returns 22 body joints, and fingers are leaves
+of the kinematic tree, so they cannot move a body joint — verified by randomising
+all 30 finger joints and measuring a **0.000e+00 m** change in the output.
+ViTPose is COCO-17 and has no finger keypoints, so the reprojection reward never
+touched them. PA-MPJPE is measured over 22 joints or fewer.
+
+**What changed as a result:**
+
+| | before | after |
+|---|---|---|
+| pose vector | 52 joints / 156 dims | 22 joints / 66 dims |
+| action width (pose-only / uv) | 156 / 158 | **66 / 68** |
+| observation width (with evidence, trans in state / out) | 362 / 356 | **182 / 176** |
+| discriminator input | 156 | **66** |
+| dims pinned at ±1 in GT | 90 | **0** |
+| one-rule real-vs-fake accuracy | 1.0000 | **0.5000** (chance) |
+| (A) lifted smoothness | 0.9824 | 0.9949 |
+
+`joints_from_poses` accepts either width and zero-fills the hands for a 22-joint
+pose. `norm_is_stale` now checks `_n_joints` as well as `_root_corrected`, so a
+stats file describing a different pose vector is regenerated rather than
+broadcast against mismatched data. The 52-joint dataset is kept as
+`data/processed_movi_52joint.h5` — it is the provenance of every result measured
+before this change — and the old statistics as
+`data/stats_52joint_backup/`.
+
+**(A) is unaffected and does not need re-measuring**, because the metric is
+computed from joints that finger pose cannot move (see the 0.000e+00 above).
+**(B) does need re-running**: the action and observation widths changed and the
+smoothness term now means something different.
+
 ### Camera frame — the root rotation fix
 
 The lifted root was in the **camera** frame, the GT in the world frame: a 93.9°
@@ -27,7 +84,7 @@ its capacity undoing.
   `R_world = F⁻¹ · (R_extᵀ)⁻¹ · R_camera`, with `F = Rz(+90°)`.
 - Applied in `data/norm_upsample.py` before normalising. Result: **93.9° → 5.2°**
   (PG1), **119.5° → 8.5°** (PG2), matching the GT-fitted upper bound.
-- Only joint 0 is affected — joints 1-51 are parent-relative.
+- Only joint 0 is affected — joints 1-21 are parent-relative.
 - The untouched camera-frame root is preserved per camera as `root_cam`, and
   calibration is embedded at `/calib/`, so the file is self-describing.
 - Fitting the offset *against GT* was rejected as leakage; those numbers are
@@ -56,7 +113,8 @@ its capacity undoing.
 
 - **Pose-only action.** 159 → 156 dims; the lifted `trans` is virtual-camera depth,
   not metres, so the policy no longer predicts it and it passes through untouched.
-  `--predict_trans` restores the old width.
+  `--predict_trans` restores the old width. Now **66 dims** after the finger
+  removal above; `--trans_mode uv` makes it 68.
 - **Policy init.** `log_std` starts at `log(0.05)` instead of `0`. At std 1.0 both
   reward terms saturate near zero, leaving PPO no gradient.
 - **Time-limit bootstrapping.** A clip running out of frames is truncation, not
@@ -104,13 +162,38 @@ term keeps the policy anchored to the image.
 
 ## Open items
 
-- **Experiment (B) has not produced a usable run yet.** The first attempt degraded
-  monotonically (reward 0.71 → 0.26, improvement 0 → −37 px) and was stopped at
-  14%. The truncation/bootstrap fix above is the leading explanation, not a proven
-  one; the current run is the test.
-- **(C) is not built.** Expert demonstrations are in `gt/`; `poses_vel` / `trans_vel`
-  exist in the raw lifted h5 but `norm_upsample` drops them (derivable by finite
-  differences).
+- **Experiment (B) does not beat doing nothing, and the 3x3 seed sweep settled it.**
+  Across seeds 42/43/44 no variant beats the uncorrected baseline: paired over
+  1,122 clip-camera deltas, t = +9.1 (frozen), +9.2 (du,dv), +11.1 (pose-only), all
+  in the *worse* direction. Held-out improvement is indistinguishable from zero for
+  all three. The (B3) pose-only advantage was seed 42 and is withdrawn. See
+  `report.md`. **The sweep must be re-run** after the finger removal above: the
+  action and observation widths changed and the smoothness term now measures body
+  motion rather than 92% finger jitter.
+- **(C) is built but not run.** `src/gail_train.py`, `src/gail_env.py`,
+  `src/models/discriminator.py`, merged from `g34`. Two bugs were fixed on the way
+  in, and one issue is still open:
+  - *Fixed — GT leak.* `src/gail_train.py` accepted `--reward_mode gt`, the
+    supervised RMSE similarity term. `reproj` needs `data/reproj_targets.h5`,
+    which needs ViTPose, so on a machine without that stack `gt` was the only
+    mode that ran and (C) would have been silently supervised. It is now rejected
+    at parse time and again inside `train()`.
+  - *Fixed — reward magnitudes.* The discriminator term was added as an absolute
+    level, `w_gail * sigmoid(D(pose))`, while every other term in (B) is baselined
+    against the lifted pose. It is now baselined the same way and scale-matched to
+    the base reward's running standard deviation, so `w_gail` states relative
+    influence: 1.0 means "contribute as much reward variation as reprojection +
+    smoothness together", 0 reproduces (B) exactly. A near-constant term is dropped
+    rather than rescaled (`gail_min_std`), since amplifying a saturated
+    discriminator's float noise would hand PPO pure noise as signal.
+  - *Open — the real bank is still in a different space than the policy output.*
+    `load_gt_transitions` reads `gt/poses`, normalised with **GT** statistics,
+    while the policy's poses are in **lifted per-camera** space. After the finger
+    removal the two clouds are still ~1.57 sigma apart (down from 2.66 on the body
+    dims, and from a 100%-separable hand block). The fix is to build the real bank
+    in the same per-camera lifted space.
+- `poses_vel` / `trans_vel` exist in the raw lifted h5 but `norm_upsample` drops
+  them (derivable by finite differences).
 - **`scripts/raw_data_val.py` betas comparison is broken.** It compares each clip
   against `clips[i-1]`, which is the *same subject* 95.2% of the time, and GT betas
   are identical within a subject — so 95.2% of cases are exact ties scored as

@@ -35,7 +35,7 @@ needs_data = pytest.mark.skipif(
     not (H5.exists() and TARGETS.exists()),
     reason="needs data/processed_movi.h5 and data/reproj_targets.h5")
 
-N_JOINTS, T = 52, 8
+N_JOINTS, T = 22, 8
 
 
 def _frame(seed):
@@ -58,10 +58,10 @@ def test_state_dim_drops_exactly_the_translation():
 def test_the_four_widths_are_what_the_docstring_says():
     from src.models.policy import state_dim
 
-    assert state_dim(False, False, True) == 318
-    assert state_dim(True, False, True) == 362
-    assert state_dim(False, False, False) == 312
-    assert state_dim(True, False, False) == 356
+    assert state_dim(False, False, True) == 138
+    assert state_dim(True, False, True) == 182
+    assert state_dim(False, False, False) == 132
+    assert state_dim(True, False, False) == 176
 
 
 @needs_env
@@ -72,8 +72,8 @@ def test_flatten_state_accepts_both_state_shapes():
     bare = {"lifted_state": poses, "corrected_state": poses.clone()}
     dicts = {"lifted_state": {"poses": poses, "trans": torch.zeros(3)},
              "corrected_state": {"poses": poses.clone(), "trans": torch.zeros(3)}}
-    assert flatten_state(bare).shape == (312,)
-    assert flatten_state(dicts).shape == (318,)
+    assert flatten_state(bare).shape == (132,)
+    assert flatten_state(dicts).shape == (138,)
 
 
 # ── the timing invariant ─────────────────────────────────────────────────────
@@ -147,7 +147,7 @@ def test_dropping_trans_from_the_state_does_not_change_the_reward():
                      verbose=False, reproj_path=str(TARGETS))
     calib = load_calib(str(H5))
     rng = np.random.default_rng(0)
-    actions = rng.normal(0, 0.02, (60, 156)).astype(np.float32)
+    actions = rng.normal(0, 0.02, (60, 66)).astype(np.float32)
 
     rewards = {}
     for state_trans in (True, False):
