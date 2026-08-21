@@ -372,13 +372,16 @@ class GymMoviEnv(gymnasium.Env):
             info["nonfinite_pose"] = True
 
         # Experiment (C): stacks on top of whichever base reward just ran.
-        # `self._prev_poses` is still frame t-1's corrected pose here — it is
-        # only overwritten below — so the pair scored is exactly
-        # (corrected_{t-1}, corrected_t), matching how `PPOWithGAIL` recovers
-        # the same pair from consecutive rows of skrl's stored `states`
-        # (`extract_corrected_pose`, src/models/policy.py).
+        # Single-frame, not a (t-1, t) transition pair — `corrected_poses` is
+        # always a genuine policy output at this point (`lifted + action`,
+        # computed by `self._inner.step` just above), never the identity
+        # placeholder `reset()` seeds `corrected_state` with before any action
+        # exists. That placeholder is exactly what a `t-1` pairing risked
+        # feeding the discriminator as a "correction" at the first frame of
+        # every episode — see `src/models/discriminator.py`'s module
+        # docstring for why the fix was to stop pairing rather than mask it.
         if self._disc_reward is not None and self.w_gail:
-            r_gail = self._disc_reward.score(self._prev_poses, corrected_poses)
+            r_gail = self._disc_reward.score(corrected_poses)
             reward = reward + self.w_gail * r_gail
             info["r_gail"] = r_gail
 

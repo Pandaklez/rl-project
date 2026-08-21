@@ -1,11 +1,11 @@
 """
 GAIL-style motion discriminator for experiment (C).
 
-Scores short windows of **consecutive, pose-only** frames as GT-like ("real")
-or corrected-output-like ("fake"), and turns that score into a per-step reward
-the policy is trained to increase — i.e. a learned substitute for the frame-
-wise GT loss that experiments (A)/(B) deliberately avoid. The discriminator is
-retrained after every rollout on the batch skrl just collected, so unlike
+Scores **single, pose-only** frames as GT-like ("real") or corrected-output-
+like ("fake"), and turns that score into a per-step reward the policy is
+trained to increase — i.e. a learned substitute for the frame-wise GT loss
+that experiments (A)/(B) deliberately avoid. The discriminator is retrained
+after every rollout on the batch skrl just collected, so unlike
 `src/rewards.py`'s reprojection reward it is not a fixed function of the
 data — it is a second model with its own optimizer, and the env only ever
 holds a *reference* to it (`GAILRewardProvider`), never a copy. Updating its
@@ -30,16 +30,25 @@ trainer (`skrl.utils.gail`, in newer skrl):
   completely ordinary — skrl's own actor/critic models *are* vanilla torch
   modules wrapped in a thin Mixin — so this costs nothing in compatibility.
 
-* Windows, not single frames or whole clips (AMP, Peng et al. 2021, uses the
-  same shape of discriminator for the same reason). A single frame gives the
-  discriminator no way to tell a plausible pose from a physically-impossible
-  *transition* between two plausible poses, which is the failure mode a
-  smoothness reward alone cannot catch either. A whole clip would need a
-  sequence model and would only score once per episode — far too sparse a
-  training signal for PPO, which wants a reward every step. Two consecutive
-  poses is the minimum window that sees velocity; `WINDOW` is kept as a
-  constant rather than hard-coded 2 so a wider window (e.g. 3, to also see
-  acceleration) is a one-line experiment later.
+* Single frames, **for now** — not the 2-frame consecutive windows an
+  AMP-style discriminator (Peng et al. 2021) normally uses to also judge
+  transition/velocity plausibility. Windows sound strictly better (they see
+  motion, not just pose), but pairing `corrected_{t-1}` with `corrected_t`
+  turned out to have a real bug: `MoviEnv.reset`/`NoTransMoviEnv.reset` seed
+  `corrected_state = lifted_state.clone()` — a placeholder identity, not a
+  policy output — for the frame before any action has been taken. A window
+  built from consecutive memory rows can therefore pair a genuine correction
+  with that raw-lifted placeholder at the first row of every episode, which
+  is exactly the "rubbish" input the discriminator was never supposed to see.
+  Single frames have no `t-1` to get wrong — the fix is not "mask the bad
+  pairs" but "stop pairing." Revisiting a windowed/AMP-style discriminator
+  later is still open (see `WINDOW`, kept below at 1 rather than deleted),
+  but it would need the reset-boundary masking done properly first, likely
+  in the recurrent-policy work already on the table rather than as a patch
+  here. Note this does not remove *motion* realism from training — the
+  existing acceleration-based smoothness reward (`src/rewards.py`) already
+  covers that, on a genuinely GT-free basis; this discriminator now covers
+  single-pose plausibility only, without overlapping it.
 
 * Pose-only, deliberately. `trans` is SMPLer-X's non-metric virtual-camera
   depth (see `src/models/policy.py`'s `§2` notes), and GT `trans` lives in a
@@ -62,7 +71,7 @@ from src.data.datasets import gt_group
 
 N_JOINTS = 52
 POSE_DIM = N_JOINTS * 3   # 156
-WINDOW = 2                # consecutive frames per discriminator input (sees velocity)
+WINDOW = 1                # frames per discriminator input; see module docstring
 
 
 def _mlp(dims: list[int], activation: type[nn.Module] = nn.ReLU) -> nn.Sequential:
@@ -80,10 +89,12 @@ def _mlp(dims: list[int], activation: type[nn.Module] = nn.ReLU) -> nn.Sequentia
 
 class MotionDiscriminator(nn.Module):
     """
-    Binary classifier over `WINDOW`-frame pose-only windows.
+    Binary classifier over `WINDOW`-frame pose-only windows (`WINDOW=1`: a
+    single pose; see module docstring for why this isn't 2 consecutive frames
+    right now).
 
-    Input:  (..., WINDOW * POSE_DIM) — consecutive normalised poses, flattened
-            and concatenated in time order. Build one with `make_window`.
+    Input:  (..., WINDOW * POSE_DIM) — normalised pose(s), flattened and
+            concatenated in time order. Build one with `make_window`.
     Output: (...,) raw logits. No sigmoid inside: the training loss applies
             `F.binary_cross_entropy_with_logits` and the reward applies
             `sigmoid` itself, and keeping the head linear is what lets the
@@ -118,9 +129,11 @@ class MotionDiscriminator(nn.Module):
 
 def make_window(*poses: torch.Tensor) -> torch.Tensor:
     """
-    Concatenate `WINDOW` consecutive `(..., 52, 3)` (or already-flat
-    `(..., 156)`) pose tensors into one `(..., WINDOW*POSE_DIM)` discriminator
-    input, oldest first.
+    Concatenate one or more `(..., 52, 3)` (or already-flat `(..., 156)`)
+    pose tensors into one `(..., WINDOW*POSE_DIM)` discriminator input,
+    oldest first. With `WINDOW=1` this is called with a single pose and is
+    just a flatten; kept general so a wider window is a one-line call-site
+    change later (see module docstring).
     """
     flat = [p.flatten(-2) if p.dim() >= 2 and p.shape[-1] == 3 else p for p in poses]
     return torch.cat(flat, dim=-1)
@@ -131,8 +144,10 @@ def make_window(*poses: torch.Tensor) -> torch.Tensor:
 def load_gt_transitions(h5_path: str, split: str = "train",
                         device: str = "cpu") -> torch.Tensor:
     """
-    Every consecutive GT pose-pair window in `split`, as one `(N, 2*POSE_DIM)`
-    tensor — the discriminator's "real" distribution.
+    Every individual GT pose in `split`, as one `(N, POSE_DIM)` tensor — the
+    discriminator's "real" distribution (named `_transitions` for continuity
+    with the windowed version this may become again; with `WINDOW=1` there is
+    no transition, just a pose).
 
     Read directly from the HDF5 file's `gt` groups rather than through
     `MoViDataset`: GT does not depend on which camera lifted a clip, so
@@ -140,18 +155,15 @@ def load_gt_transitions(h5_path: str, split: str = "train",
     every clip with two cameras twice and bias the real distribution toward
     it. Iterating the file's clip groups directly counts each clip once.
     """
-    windows = []
+    poses_per_clip = []
     with h5py.File(h5_path, "r") as f:
         for clip_name in f[split].keys():
             grp = gt_group(f[split][clip_name])
-            poses = grp["poses"][:].astype(np.float32).reshape(-1, POSE_DIM)
-            if poses.shape[0] < WINDOW:
-                continue
-            windows.append(np.concatenate([poses[:-1], poses[1:]], axis=1))
-    if not windows:
-        raise ValueError(f"no GT transitions found under {h5_path}:{split}")
-    all_windows = np.concatenate(windows, axis=0)
-    return torch.from_numpy(all_windows).to(device)
+            poses_per_clip.append(grp["poses"][:].astype(np.float32).reshape(-1, POSE_DIM))
+    if not poses_per_clip:
+        raise ValueError(f"no GT poses found under {h5_path}:{split}")
+    all_poses = np.concatenate(poses_per_clip, axis=0)
+    return torch.from_numpy(all_poses).to(device)
 
 
 # ─── Training step ──────────────────────────────────────────────────────────
@@ -226,8 +238,8 @@ def discriminator_step(
 
 class GAILRewardProvider:
     """
-    The live handle `src/gail_env.py::GymMoviEnv` calls every step to score a
-    corrected-pose transition against the discriminator currently being
+    The live handle `src/gail_env.py::GymMoviEnv` calls every step to score
+    the current corrected pose against the discriminator currently being
     trained.
 
     This is deliberately *not* a snapshot: `discriminator`'s weights are
@@ -250,14 +262,14 @@ class GAILRewardProvider:
         self.device = torch.device(device)
 
     @torch.no_grad()
-    def score(self, prev_pose: torch.Tensor, pose: torch.Tensor) -> float:
-        """Probability, under the current discriminator, that the transition
-        `prev_pose -> pose` is real GT motion. Bounded to (0, 1), so it stacks
-        with the reprojection/smoothness terms (`src/rewards.py`) on the same
-        rough scale without needing its own `reward_scale`."""
+    def score(self, pose: torch.Tensor) -> float:
+        """Probability, under the current discriminator, that `pose` is a
+        real GT pose. Bounded to (0, 1), so it stacks with the
+        reprojection/smoothness terms (`src/rewards.py`) on the same rough
+        scale without needing its own `reward_scale`."""
         was_training = self.discriminator.training
         self.discriminator.eval()
-        window = make_window(prev_pose, pose).reshape(1, -1).to(self.device)
+        window = make_window(pose).reshape(1, -1).to(self.device)
         reward = torch.sigmoid(self.discriminator(window)).item()
         self.discriminator.train(was_training)
         return reward

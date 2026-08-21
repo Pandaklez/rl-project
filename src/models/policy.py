@@ -258,15 +258,17 @@ def extract_corrected_pose(state: torch.Tensor, state_trans: bool = True) -> tor
         state_trans=False:  [lifted(156), corrected(156), ...]
 
     Exists so the GAIL discriminator (`src/gail_train.py::PPOWithGAIL`) can
-    read the policy's corrected-pose transitions straight out of skrl's
-    on-policy memory instead of re-deriving them from the env: row t of the
-    stored `states` tensor carries corrected_{t-1}, row t+1 carries
-    corrected_t (skrl stores one observation per step, not a parallel
-    "next state" tensor — see `PPOWithGAIL._update_discriminator` for the
-    episode-boundary masking consecutive-row pairing needs). One definition
-    here rather than duplicating the offset arithmetic at the call site keeps
-    it from drifting out of sync with `flatten_state` the way `state_dim` is
-    kept in sync everywhere else.
+    read the policy's corrected poses straight out of skrl's on-policy memory
+    instead of re-deriving them from the env: row t of the stored `states`
+    tensor carries corrected_{t-1} — the correction the *previous* action
+    produced (see `flatten_state`). Not every row is a genuine policy output
+    though: the first row of each episode carries `reset()`'s identity
+    placeholder instead (`corrected_state = lifted_state.clone()`, before any
+    action exists) — `PPOWithGAIL._update_discriminator` masks those rows out
+    rather than treating this function's output as always trustworthy. One
+    definition here rather than duplicating the offset arithmetic at the call
+    site keeps it from drifting out of sync with `flatten_state` the way
+    `state_dim` is kept in sync everywhere else.
     """
     off = POSE_DIM + (TRANS_DIM if state_trans else 0)
     return state[..., off:off + POSE_DIM]

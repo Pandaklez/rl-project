@@ -140,23 +140,27 @@ class PPOWithGAIL(PPOWithPoseViz):
 
     The discriminator update runs once per rollout, on exactly the batch PPO
     is about to consume for its policy update — no separate data collection
-    pass, since the "fake" samples it needs (the policy's corrected-pose
-    transitions) are already sitting in `self.memory`.
+    pass, since the "fake" samples it needs (the policy's corrected poses)
+    are already sitting in `self.memory`.
 
-    skrl's on-policy memory stores one tensor per step, `states`, not a
-    parallel `next_states` (`next_states` exists only transiently, as the
-    single extra observation needed for the value bootstrap — it is never
-    written per-step, precisely because it would just be `states` shifted by
-    one row). That shift is exactly what this needs though: `flatten_state`
-    packs the *previous* step's correction into the *current* step's
-    observation, so row t of `states` carries corrected_{t-1} and row t+1
-    carries corrected_t (`extract_corrected_pose`, src/models/policy.py). The
-    transition pair is therefore `states[t], states[t+1]` — with one
-    exception: at an episode boundary (`terminated[t]` or `truncated[t]`),
-    `states[t+1]` is the *next* episode's reset observation, not a
-    continuation, and pairing across that seam would hand the discriminator a
-    fake "transition" that never happened in either clip. Those rows are
-    masked out below rather than scored.
+    skrl's on-policy memory stores one tensor per step, `states`. Row t's
+    observation carries corrected_{t-1} — the correction the *previous*
+    action produced (`flatten_state`, `extract_corrected_pose`) — which is a
+    genuine policy output for every row **except** the first row of each
+    episode, whose corrected-slot is still `reset()`'s identity placeholder
+    (`corrected_state = lifted_state.clone()`, seeded before any action
+    exists — see `MoviEnv.reset`/`NoTransMoviEnv.reset`). Feeding that
+    placeholder to the discriminator as if it were a correction is exactly
+    the bug a single-frame discriminator with no `t-1` pairing avoids by
+    construction for the live env-side reward (`src/gail_env.py::step`,
+    which only ever scores the pose it just computed) — but the *training*
+    batch here is read back out of memory rows, which still include that
+    placeholder row whenever an episode reset mid-rollout, so it has to be
+    masked out explicitly: a row is dropped if the row before it ended an
+    episode (`terminated`/`truncated`), and row 0 of this rollout's buffer is
+    dropped unconditionally too, since whether *it* follows a reset depends
+    on how the *previous* rollout ended, which this function has no
+    visibility into. That drops at most one extra sample out of `rollouts`.
 
     Runs **before** `super().post_interaction()` on an update boundary, so the
     discriminator is trained on this rollout before PPO's own `update()`
@@ -195,23 +199,23 @@ class PPOWithGAIL(PPOWithPoseViz):
         truncated  = self.memory.get_tensor_by_name("truncated")   # (T, num_envs, 1)
         done = (terminated | truncated).squeeze(-1)                # (T, num_envs)
 
-        # states[t] -> states[t+1], dropping pairs that straddle an episode
-        # boundary (see class docstring).
-        prev, curr = states[:-1], states[1:]
-        valid = ~done[:-1]
-        obs_dim = states.shape[-1]
-        prev = prev.reshape(-1, obs_dim)[valid.reshape(-1)]
-        curr = curr.reshape(-1, obs_dim)[valid.reshape(-1)]
+        # A row's corrected-slot is `reset()`'s identity placeholder, not a
+        # policy output, iff it is the first row of an episode: either the
+        # row before it ended one (`done`), or it's row 0 of this rollout's
+        # buffer and therefore of unknown provenance (see class docstring).
+        T, num_envs, obs_dim = states.shape
+        fresh = torch.zeros(T, num_envs, dtype=torch.bool, device=states.device)
+        fresh[0] = True
+        fresh[1:] = done[:-1]
+        valid = (~fresh).reshape(-1)
 
-        fake_prev = extract_corrected_pose(prev, self.state_trans)
-        fake_curr = extract_corrected_pose(curr, self.state_trans)
-        # (n_valid, 2*POSE_DIM), oldest frame first — matches `make_window`'s
-        # ordering and `load_gt_transitions`'s layout.
-        fake_windows = torch.cat([fake_prev, fake_curr], dim=-1).to(device).detach()
+        fake_poses = extract_corrected_pose(
+            states.reshape(-1, obs_dim)[valid], self.state_trans)
+        fake_poses = fake_poses.to(device).detach()
 
-        n_fake = fake_windows.shape[0]
+        n_fake = fake_poses.shape[0]
         n_real = self.real_bank.shape[0]
-        if n_fake == 0:      # every step this rollout ended an episode — degenerate but possible
+        if n_fake == 0:      # every row this rollout was a fresh episode start — degenerate but possible
             return
 
         self.discriminator.train()
@@ -220,7 +224,7 @@ class PPOWithGAIL(PPOWithPoseViz):
             fi = torch.randint(0, n_fake, (self.disc_batch_size,), device=device)
             ri = torch.randint(0, n_real, (self.disc_batch_size,))
             real_batch = self.real_bank[ri].to(device)
-            fake_batch = fake_windows[fi]
+            fake_batch = fake_poses[fi]
 
             loss, logs = discriminator_step(
                 self.discriminator, real_batch, fake_batch,
