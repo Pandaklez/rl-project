@@ -386,7 +386,45 @@ class Config:
     seed:   int = 42
 
 
+def check_reward_composition(cfg: Config) -> None:
+    """
+    Refuse to start a run that would leak GT through two channels at once.
+
+    Experiment (C) is "(B) + a discriminator reward, and nothing else new" —
+    reprojection + smoothness stay exactly as GT-free as they are in (B); the
+    discriminator's real-motion bank (`load_gt_transitions`) is meant to be
+    the *only* place GT enters the loop, and it only ever sees the corrected
+    pose the policy produces, never GT-derived features fed back as reward
+    directly (`src/gail_env.py::GymMoviEnv.step`, `src/models/discriminator.py`).
+
+    `reward_mode="gt"` is a different thing: `src/env.py`'s direct frame-wise
+    GT-similarity ablation, valid **on its own** (`w_gail=0`) as an infra
+    smoke test when `data/reproj_targets.h5` isn't built yet — that's how
+    this repo's own validation runs work before the reprojection sidecar
+    exists. But combined with an active discriminator (`w_gail>0`) it
+    reintroduces GT through a second, much denser channel that swamps the
+    discriminator's sparser signal and stops it from being "the only
+    leakage" — exactly the composition an earlier run here used by mistake.
+    Called at the very top of `train()`, before any dataset/model
+    construction, so a bad `Config` fails immediately rather than after
+    minutes of setup (or, worse, a full run whose curves quietly meant
+    something other than experiment C).
+    """
+    if cfg.reward_mode == "gt" and cfg.w_gail > 0:
+        raise ValueError(
+            "reward_mode='gt' (direct GT-similarity reward) cannot be combined "
+            f"with an active GAIL term (w_gail={cfg.w_gail} > 0): this leaks GT "
+            "through two channels at once, which is not experiment (C). Use "
+            "one of:\n"
+            "  --reward_mode reproj --w_gail <nonzero>   the real (B) + "
+            "discriminator composition (needs data/reproj_targets.h5)\n"
+            "  --reward_mode gt --w_gail 0                infra-only smoke "
+            "test, discriminator built but not contributing to reward"
+        )
+
+
 def train(cfg: Config) -> None:
+    check_reward_composition(cfg)
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
     np.random.seed(cfg.seed)
@@ -421,6 +459,17 @@ def train(cfg: Config) -> None:
                  else ", NO keypoint-bias correction"))
     else:
         print("Reward: GT similarity + smoothness (supervised; ablation only)")
+
+    # `check_reward_composition` already ruled out gt + w_gail>0, so this is
+    # exhaustive: either reproj-only-GT-via-discriminator, or the pure GT
+    # ablation with the discriminator built but silent.
+    if use_reproj and cfg.w_gail > 0:
+        gt_leak = f"discriminator only (w_gail={cfg.w_gail}) — experiment (C)"
+    elif use_reproj:
+        gt_leak = "none — this is experiment (B), w_gail=0"
+    else:
+        gt_leak = "reward_mode='gt' direct similarity term — ablation, not (C)"
+    print(f"GT leakage: {gt_leak}")
 
     # ── Discriminator (experiment C) ────────────────────────────────────────
     # Built before the env because the env holds a *reference* to the
