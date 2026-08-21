@@ -613,7 +613,10 @@ def train(cfg: Config) -> None:
     # with `AttributeError: Can't get attribute 'Config' on <module '__main__'>`.
     ckpt_path = Path(cfg.out_dir) / "actor_final.pt"
     torch.save({"actor": actor.state_dict(), "config": asdict(cfg)}, str(ckpt_path))
-    print(f"Actor weights saved → {ckpt_path}")
+    # ASCII "->", not "→" — see src/train.py's identical checkpoint print for why
+    # (Windows console cp1252 has no glyph for U+2192; discovered because this
+    # crashed the discriminator save right below on a real Windows run).
+    print(f"Actor weights saved -> {ckpt_path}")
 
     # The discriminator is not needed by evaluate.py/viz_pose.py, but keeping
     # it is what makes it possible to resume GAIL training, or to inspect
@@ -621,7 +624,7 @@ def train(cfg: Config) -> None:
     disc_ckpt_path = Path(cfg.out_dir) / "discriminator_final.pt"
     torch.save({"discriminator": discriminator.state_dict(), "config": asdict(cfg)},
               str(disc_ckpt_path))
-    print(f"Discriminator weights saved → {disc_ckpt_path}")
+    print(f"Discriminator weights saved -> {disc_ckpt_path}")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

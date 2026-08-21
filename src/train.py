@@ -444,7 +444,11 @@ def train(cfg: Config) -> None:
     # with `AttributeError: Can't get attribute 'Config' on <module '__main__'>`.
     ckpt_path = Path(cfg.out_dir) / "actor_final.pt"
     torch.save({"actor": actor.state_dict(), "config": asdict(cfg)}, str(ckpt_path))
-    print(f"Actor weights saved → {ckpt_path}")
+    # ASCII "->", not "→": Windows' console defaults to the cp1252 codepage,
+    # which has no glyph for U+2192 and raises UnicodeEncodeError on print —
+    # after the checkpoint above is already written, so a real run would exit
+    # non-zero right at the finish line instead of reporting success.
+    print(f"Actor weights saved -> {ckpt_path}")
 
 
 # ─── Entry point ──────────────────────────────────────────────────────────────

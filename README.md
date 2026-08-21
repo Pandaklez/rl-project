@@ -19,9 +19,24 @@ what was fixed, and the measurements behind each decision.
 
 Two interpreters are in play, and the difference matters:
 
-- **`smplerx` conda env (Python 3.8)** — needed for anything touching `smplx` or
-  `torch`: training, evaluation, forward kinematics, `scripts/extract_2d.py`.
-- **system Python 3.12** — fine for the data/geometry scripts and the test suite.
+- **`smplerx` conda env (Python 3.8, Linux/CUDA 11.7)** — needed for anything
+  touching `smplx` or `torch`: training, evaluation, forward kinematics, and
+  the only env with the mm* stack for `scripts/extract_2d.py`. Created from
+  `environment.yaml`.
+- **system Python 3.12** — fine for the data/geometry scripts and the test
+  suite.
+
+On Windows, `environment.yaml`'s conda pins don't solve (Linux build strings,
+CUDA 11.7). **`environment_windows.yaml`** is the Windows equivalent of
+`smplerx` — same coverage (`src/`, `tests/`, training including the GAIL
+discriminator), different toolchain (Python 3.10, torch 2.11/CUDA 13, no mm*
+stack — see its header for why that's fine for everything except
+`scripts/extract_2d.py`). Create it the same way:
+
+```bash
+conda env create -f environment_windows.yaml
+conda activate rl_project
+```
 
 Code that has to run under both carries `from __future__ import annotations`;
 without it, `list[int]` annotations are evaluated at def-time and crash on 3.8.

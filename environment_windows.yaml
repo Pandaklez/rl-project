@@ -1,0 +1,292 @@
+# environment_windows.yaml — the `rl_project` conda environment: the Windows
+# counterpart of `environment.yaml` (the `smplerx` env, exported from a Linux
+# CUDA 11.7 machine). Covers everything under `src/` and `tests/` — training,
+# the GAIL discriminator, evaluation, forward kinematics, the test suite.
+#
+#     conda env create -f environment_windows.yaml
+#     conda activate rl_project
+#
+# Exported from the working environment with `conda env export --no-builds`,
+# so versions are pinned but builds are not (builds are OS/compiler-specific
+# and would make this file fail to solve on a different Windows machine for no
+# real reason).
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM environment.yaml
+#
+# `environment.yaml` pins Python 3.8 / torch 1.13.1 / CUDA 11.7 because
+# mmcv-full 1.7.1 and mmdet 2.26.0 are compiled against that exact
+# combination — see its header. Nothing under `src/` or `tests/` needs the
+# mm* stack (only `scripts/extract_2d.py` does, for the SMPLer-X ViTPose
+# inference path), so this env carries none of it and is free to run
+# Python 3.10 / torch 2.11 / CUDA 13 instead. **Do not try to make the two
+# files agree on Python/torch/CUDA** — they are pinned for different, disjoint
+# reasons, and this one has been verified against this repo's actual code, not
+# derived from the other by translation:
+#
+#   - `python -m pytest tests/` — 77 passed, 8 skipped (skips need
+#     data/reproj_targets.h5, not a package problem)
+#   - A real `python -m src.gail_train` run (env + skrl PPO + the GAIL
+#     discriminator + checkpointing + TensorBoard) to completion.
+#
+# THINGS THIS FILE CANNOT CAPTURE (mirrors environment.yaml's three points)
+#
+# 1. Nothing is installed here for `scripts/extract_2d.py`'s mm* stack
+#    (mmcv-full, mmdet, mmengine, mmpose / the editable
+#    `smpler-x-main/transformer_utils` install). It was skipped deliberately,
+#    not overlooked: mmcv-full 1.7.1 needs compiling against torch 1.13.1 +
+#    CUDA 11.7 specifically, which is a different, incompatible fight from the
+#    torch 2.11 / CUDA 13 stack the rest of this file pins. If you need that
+#    inference path, it belongs in its own environment (or in `smplerx` on a
+#    Linux box), not bolted onto this one.
+#
+# 2. Model and data files. The SMPL-X body models (SMPLX_NEUTRAL.npz etc.,
+#    expected at common/utils/human_model_files/smplx/), the mmdet/vitpose
+#    checkpoints (only if you do set up #1), and everything under data/ are
+#    not Python packages. See README.md.
+#
+# 3. Unlike environment.yaml, `pytest` IS included below — it was missing
+#    from the env this file was exported from, and got installed as part of
+#    getting this environment working, so `conda env export` picked it up
+#    for free.
+#
+# HONESTLY: THIS ENV HAS CLUTTER
+#
+# `rl_project` started as a copy of an unrelated general-purpose/Jupyter
+# environment, not one built for this repo, and the export below reflects
+# that — jupyter*, ipykernel, ipywidgets, PyQt6, pandas, decord and friends
+# are all in here and none of them are used by anything under `src/` or
+# `tests/` (checked by grepping every import). They're harmless to keep — a
+# fresh, minimal env would work exactly as well — but don't read their
+# presence below as this project depending on Jupyter or Qt.
+name: rl_project
+channels:
+  - defaults
+  - conda-forge
+dependencies:
+  - anyio=4.12.1
+  - argon2-cffi=25.1.0
+  - argon2-cffi-bindings=25.1.0
+  - asttokens=3.0.1
+  - async-lru=2.0.5
+  - attrs=26.1.0
+  - babel=2.17.0
+  - beautifulsoup4=4.14.3
+  - blas=1.0
+  - bleach=6.3.0
+  - bottleneck=1.4.2
+  - brotlicffi=1.2.0.0
+  - bzip2=1.0.8
+  - ca-certificates=2026.5.14
+  - cached-property=2.0.1
+  - cairo=1.18.4
+  - certifi=2026.6.17
+  - cffi=2.0.0
+  - charset-normalizer=3.4.4
+  - cloudpickle=3.1.2
+  - colorama=0.4.6
+  - comm=0.2.3
+  - conpty=1.23.20211.0
+  - contourpy=1.3.1
+  - cycler=0.12.1
+  - debugpy=1.8.16
+  - decorator=5.2.1
+  - defusedxml=0.7.1
+  - exceptiongroup=1.3.0
+  - executing=2.2.1
+  - expat=2.7.5
+  - farama-notifications=0.0.4
+  - fontconfig=2.15.0
+  - fonttools=4.62.1
+  - freetype=2.14.1
+  - graphite2=1.3.14
+  - gymnasium=1.3.0
+  - h11=0.16.0
+  - h5py=3.16.0
+  - harfbuzz=12.3.0
+  - hdf5=1.14.6
+  - html5lib=1.1
+  - httpcore=1.0.9
+  - httpx=0.28.1
+  - icu=73.1
+  - idna=3.11
+  - intel-openmp=2025.0.0
+  - ipykernel=7.2.0
+  - ipython=8.30.0
+  - ipython_pygments_lexers=1.1.1
+  - ipywidgets=8.1.7
+  - jax-jumpy=1.0.0
+  - jedi=0.19.2
+  - jinja2=3.1.6
+  - joblib=1.5.3
+  - jpeg=9f
+  - json5=0.12.1
+  - jsonschema=4.25.1
+  - jsonschema-specifications=2025.9.1
+  - jupyter=1.1.1
+  - jupyter-lsp=2.3.0
+  - jupyter_client=8.8.0
+  - jupyter_console=6.6.3
+  - jupyter_core=5.9.1
+  - jupyter_events=0.12.0
+  - jupyter_server=2.17.0
+  - jupyter_server_terminals=0.5.4
+  - jupyterlab=4.5.6
+  - jupyterlab_pygments=0.3.0
+  - jupyterlab_server=2.28.0
+  - jupyterlab_widgets=3.0.16
+  - kiwisolver=1.4.9
+  - lcms2=2.16
+  - lerc=3.0
+  - libaec=1.1.6
+  - libbrotlicommon=1.2.0
+  - libbrotlidec=1.2.0
+  - libbrotlienc=1.2.0
+  - libcurl=8.19.0
+  - libdeflate=1.17
+  - libexpat=2.7.5
+  - libffi=3.4.4
+  - libglib=2.86.3
+  - libhwloc=2.12.1
+  - libiconv=1.18
+  - libkrb5=1.22.1
+  - liblzma=5.8.2
+  - libpng=1.6.56
+  - libpq=17.6
+  - libsodium=1.0.20
+  - libsqlite=3.53.4
+  - libssh2=1.11.1
+  - libtiff=4.5.1
+  - libwebp-base=1.6.0
+  - libxml2=2.13.9
+  - libzlib=1.3.1
+  - lz4-c=1.9.4
+  - markupsafe=3.0.3
+  - matplotlib=3.10.8
+  - matplotlib-base=3.10.8
+  - matplotlib-inline=0.2.1
+  - mistune=3.1.2
+  - mkl=2025.0.0
+  - mkl-service=2.5.2
+  - mkl_fft=2.1.1
+  - mkl_random=1.3.0
+  - mysql-common=9.3.0
+  - mysql-libs=9.3.0
+  - nbclient=0.10.4
+  - nbconvert=7.17.0
+  - nbconvert-core=7.17.0
+  - nbconvert-pandoc=7.17.0
+  - nbformat=5.10.4
+  - nest-asyncio=1.6.0
+  - notebook=7.5.5
+  - notebook-shim=0.2.4
+  - numexpr=2.14.1
+  - openjpeg=2.5.2
+  - openssl=3.5.7
+  - overrides=7.7.0
+  - packaging=26.0
+  - pandas=2.3.3
+  - pandoc=3.8
+  - pandocfilters=1.5.1
+  - parso=0.8.5
+  - pcre2=10.46
+  - pip=26.0.1
+  - pixman=0.46.4
+  - platformdirs=4.9.4
+  - prometheus_client=0.24.1
+  - prompt-toolkit=3.0.52
+  - prompt_toolkit=3.0.52
+  - psutil=7.0.0
+  - pure_eval=0.2.3
+  - pycparser=3.0
+  - pygments=2.20.0
+  - pyparsing=3.2.5
+  - pyqt=6.11.0
+  - pyqt6-sip=13.11.1
+  - pysocks=1.7.1
+  - python=3.10.20
+  - python-dateutil=2.9.0post0
+  - python-fastjsonschema=2.21.2
+  - python-json-logger=4.0.0
+  - python-tzdata=2025.3
+  - python_abi=3.10
+  - pytz=2026.1.post1
+  - pywin32=311
+  - pywinpty=3.0.2
+  - pyyaml=6.0.3
+  - pyzmq=27.1.0
+  - qtbase=6.11.0
+  - qtconsole=5.7.2
+  - qtdeclarative=6.11.0
+  - qtpy=2.4.3
+  - qtsvg=6.11.0
+  - qttools=6.11.0
+  - qtwebchannel=6.11.0
+  - qtwebsockets=6.11.0
+  - referencing=0.37.0
+  - requests=2.33.1
+  - rfc3339-validator=0.1.4
+  - rfc3986-validator=0.1.1
+  - rpds-py=0.28.0
+  - scikit-learn=1.7.1
+  - scipy=1.15.3
+  - send2trash=1.8.3
+  - sip=6.15.1
+  - six=1.17.0
+  - soupsieve=2.5
+  - sqlite=3.51.2
+  - stack_data=0.6.3
+  - tbb=2022.3.0
+  - tbb-devel=2022.3.0
+  - terminado=0.18.1
+  - threadpoolctl=3.5.0
+  - tinycss2=1.4.0
+  - tk=8.6.15
+  - tomli=2.4.0
+  - tornado=6.5.5
+  - traitlets=5.14.3
+  - typing-extensions=4.15.0
+  - typing_extensions=4.15.0
+  - tzdata=2026a
+  - ucrt=10.0.22621.0
+  - urllib3=2.6.3
+  - vc=14.3
+  - vc14_runtime=14.44.35208
+  - vs2015_runtime=14.44.35208
+  - wcwidth=0.2.14
+  - webencodings=0.5.1
+  - websocket-client=1.8.0
+  - wheel=0.46.3
+  - widgetsnbextension=4.0.14
+  - win_inet_pton=1.1.0
+  - winpty=0.4.3
+  - xz=5.8.2
+  - yaml=0.2.5
+  - zeromq=4.3.5
+  - zlib=1.3.1
+  - zstd=1.5.7
+  - pip:
+      - absl-py==2.4.0
+      - decord==0.6.0
+      - filelock==3.25.2
+      - fsspec==2026.2.0
+      - grpcio==1.81.1
+      - iniconfig==2.3.0
+      - markdown==3.10.2
+      - mpmath==1.3.0
+      - networkx==3.4.2
+      - numpy==2.2.6
+      - opencv-python==4.13.0.92
+      - pillow==12.1.1
+      - pluggy==1.6.0
+      - protobuf==7.35.1
+      - pytest==9.1.1
+      - setuptools==70.2.0
+      - skrl==1.4.3
+      - smplx==0.1.28
+      - sympy==1.14.0
+      - tensorboard==2.20.0
+      - tensorboard-data-server==0.7.2
+      - torch==2.11.0+cu130
+      - torchvision==0.26.0+cu130
+      - tqdm==4.68.3
+      - werkzeug==3.1.8
