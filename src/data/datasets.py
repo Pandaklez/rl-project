@@ -87,7 +87,19 @@ def resample_to(arr, T):
 class MoViDataset(Dataset):
     def __init__(self, h5_path, norm_stats_path, split="train", device="cpu",
                  cameras=("pg1", "pg2"), keys=("poses", "trans", "betas"), verbose=False,
-                 reproj_path=None):
+                 reproj_path=None, clips=None):
+        """
+        `clips` restricts the dataset to a subset of the split's clip names,
+        for experiment (C)'s disjoint demonstration set: the GAIL discriminator
+        is trained on GT from clips the policy never rolls out, so it cannot
+        reward the policy for reproducing the ground truth of the very clip it
+        is correcting (`src.models.discriminator.split_demo_clips`). `None`
+        keeps every clip in the split, which is what (A) and (B) use.
+
+        Names not present in the split are an error rather than a silent
+        no-op: a typo or a stale clip list would otherwise shrink the training
+        set without saying so.
+        """
         super().__init__()
         self.h5_path = h5_path
         self.norm_stats_path = norm_stats_path
@@ -103,8 +115,19 @@ class MoViDataset(Dataset):
         with open(norm_stats_path, "r") as f:
             self.norm_stats = json.load(f)
 
+        self.clips = None if clips is None else set(clips)
+
         with h5py.File(h5_path, "r") as f:
+            available = set(f[split].keys())
+            if self.clips is not None:
+                missing = self.clips - available
+                if missing:
+                    raise ValueError(
+                        f"{len(missing)} requested clip(s) are not in {split}, "
+                        f"e.g. {sorted(missing)[:3]}")
             for clip_name in f[split].keys():
+                if self.clips is not None and clip_name not in self.clips:
+                    continue
                 clip_grp = f[split][clip_name]
                 for camera in self.cameras:
                     if camera in clip_grp:

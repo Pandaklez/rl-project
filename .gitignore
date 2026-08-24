@@ -30,6 +30,7 @@ checkpoints/
 # .gitignore only affects untracked paths.
 data/
 data/*
+Calib/
 
 demo/*
 .claude/*
@@ -254,3 +255,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# generated: per-clip PA-MPJPE dumps from src/evaluate.py --dump_scores
+# eval_scores_52joint/ is the superseded pre-finger-removal sweep, kept
+# locally for comparison; both regenerate from checkpoints/ on demand.
+eval_scores/
+eval_scores_52joint/
+

@@ -31,7 +31,7 @@ STATE_DIM_NO_TRANS = 2 * FRAME_DIM_NO_TRANS   # 132
 
 # Width of the 2D-evidence block (src/rewards.py owns the layout). Imported by
 # value rather than re-derived so the two cannot drift apart.
-from src.rewards import EVIDENCE_DIM     # noqa: E402  (44)
+from src.rewards import CONTEXT_DIM, EVIDENCE_DIM     # noqa: E402  (5, 44)
 
 
 def state_dim(use_evidence: bool = False, use_betas: bool = False,
@@ -277,6 +277,31 @@ def extract_corrected_pose(state: torch.Tensor, state_trans: bool = True) -> tor
     """
     off = POSE_DIM + (TRANS_DIM if state_trans else 0)
     return state[..., off:off + POSE_DIM]
+
+
+def extract_camera_onehot(state: torch.Tensor, state_trans: bool = True) -> torch.Tensor:
+    """
+    Slice the PG1/PG2 one-hot back out of a flat observation built by
+    `flatten_state`, as `(..., 2)`.
+
+    Exists for the same reason as `extract_corrected_pose`: experiment (C)'s
+    discriminator reads the policy's corrected poses straight out of skrl's
+    on-policy memory, and those poses are normalised in **lifted per-camera**
+    space, so mapping them into the discriminator's space needs to know which
+    camera each row came from. The memory stores only `states`, but the camera
+    is already in there — `src.rewards.ReprojectionReward.clip_context` writes
+    it as `context[0:2]`, the first two of the 5-dim context tail of the
+    `EVIDENCE_DIM` block that `flatten_state` appends last.
+
+    Only valid when the observation carries the evidence block, i.e. under
+    `reward_mode="reproj"` — which experiment (C) requires anyway.
+
+        [lifted(66), lifted_trans(3)?, corrected(66), corrected_trans(3)?,
+         resid(24), conf(12), err/valid/t_frac(3), context(5)]
+                                                   ^^^^^^^^^^ camera is [0:2]
+    """
+    off = 2 * POSE_DIM + (2 * TRANS_DIM if state_trans else 0) + (EVIDENCE_DIM - CONTEXT_DIM)
+    return state[..., off:off + 2]
 
 
 def unflatten_action(action: torch.Tensor) -> dict[str, torch.Tensor]:

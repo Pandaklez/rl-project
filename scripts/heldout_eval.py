@@ -1,5 +1,5 @@
 """
-Held-out validation improvement, recovered from saved checkpoints.
+Held-out reprojection improvement, recovered from saved checkpoints.
 
 `pose/img_improvement_px` is normally written to TensorBoard during training by
 `ImagePoseVizLogger`, but only when `--viz_interval > 0`. The nine runs in
@@ -7,10 +7,16 @@ Held-out validation improvement, recovered from saved checkpoints.
 never written.
 
 It does not need to be. The metric is a pure function of the final actor weights
-and the validation clips — `ImagePoseVizLogger._rollout` just calls
-`rollout_policy` with the actor — so it can be recovered afterwards by rolling
-each saved `actor_final.pt` over the val split. Only the endpoint comes back this
-way, not the curve, which is what `report.md` reads anyway.
+and the scored clips — `ImagePoseVizLogger._rollout` just calls `rollout_policy`
+with the actor — so it can be recovered afterwards by rolling each saved
+`actor_final.pt` over the split. Only the endpoint comes back this way, not the
+curve, which is what `report.md` reads anyway.
+
+**Scored on `test` by default**, the same split as the PA-MPJPE table, so the two
+rows of report.md describe the same clips. It used to default to `val`, which was
+inherited from `ImagePoseVizLogger`'s role as a training-time logger rather than
+chosen for this metric; nothing was ever selected on val, so the separation bought
+nothing and cost comparability. `--split val` reproduces the older numbers.
 
 Every checkpoint is scored on the **same** clips: `--clip_seed` is fixed here
 rather than taken from each run's own `cfg["seed"]`, so the lifted error is
@@ -47,11 +53,15 @@ from src.models.policy import PoseActor, trans_mode_from_width
 from src.rewards import ReprojectionReward, load_calib
 from src.viz_pose import ImagePoseVizLogger
 
-VARIANTS = {"frozen": "(B1) frozen", "uv": "(B2) du,dv", "notrans": "(B3) pose-only"}
+VARIANTS = {"frozen": "(B1) frozen", "uv": "(B2) du,dv", "notrans": "(B3) pose-only",
+            # (C) feet ablation, under checkpoints/gail_c; absent from a (B)
+            # run set, where the table loop simply skips them.
+            "feet_in": "(C) GAIL, feet in", "feet_out": "(C) GAIL, feet out"}
 
 
 def evaluate_one(ckpt_path: Path, h5: str, norm: str, n_clips: int,
-                 n_frames: int, clip_seed: int, device: str) -> dict:
+                 n_frames: int, clip_seed: int, device: str,
+                 split: str = "test") -> dict:
     ckpt = torch.load(str(ckpt_path), map_location=device)
     cfg = ckpt["config"]
 
@@ -67,7 +77,7 @@ def evaluate_one(ckpt_path: Path, h5: str, norm: str, n_clips: int,
     actor.eval()
 
     reproj_path = cfg.get("reproj_path", "data/reproj_targets.h5")
-    dataset = MoViDataset(h5, norm, split="val", verbose=False, reproj_path=reproj_path)
+    dataset = MoViDataset(h5, norm, split=split, verbose=False, reproj_path=reproj_path)
     with open(norm) as f:
         gt_stats = json.load(f)
 
@@ -95,7 +105,12 @@ def main() -> None:
     p.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     p.add_argument("--h5_path", default="data/processed_movi.h5")
     p.add_argument("--norm_stats_path", default="data/normalization.json")
-    p.add_argument("--n_clips", type=int, default=80)
+    p.add_argument("--split", default="test",
+                   help="split to score on; 'test' matches the PA-MPJPE table, "
+                        "'val' reproduces the older held-out numbers")
+    p.add_argument("--n_clips", type=int, default=200,
+                   help="clips sampled from the split; the default covers "
+                        "all 187 test clips")
     p.add_argument("--n_frames", type=int, default=12)
     p.add_argument("--clip_seed", type=int, default=42,
                    help="fixed clip selection, so all runs see identical clips")
@@ -111,7 +126,7 @@ def main() -> None:
     for r in runs:
         res[r] = evaluate_one(sweep / r / "actor_final.pt", args.h5_path,
                               args.norm_stats_path, args.n_clips, args.n_frames,
-                              args.clip_seed, args.device)
+                              args.clip_seed, args.device, split=args.split)
         print(f"  {r:<14} improvement {res[r]['pose/img_improvement_px']:+.4f} px "
               f"(lifted {res[r]['pose/img_err_lifted_px']:.4f}, "
               f"{res[r]['n_clips_used']} clips)", flush=True)

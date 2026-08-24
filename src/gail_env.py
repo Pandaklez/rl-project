@@ -127,8 +127,8 @@ class NoTransMoviEnv:
         """
         Apply the correction and advance to the next lifted frame.
 
-        action      : {"poses": (52, 3), "trans_delta": (3,)} from `unflatten_action`
-        next_lifted : {"poses": (52, 3), "trans": (3,)} — the clip at t+1
+        action      : {"poses": (22, 3), "trans_delta": (3,)} from `unflatten_action`
+        next_lifted : {"poses": (22, 3), "trans": (3,)} — the clip at t+1
         """
         self.state["corrected_state"] = (
             self.state["lifted_state"] + action["poses"].to(self.device))
@@ -164,6 +164,42 @@ def compute_reward(
         vel     = corrected[key] - prev_corrected[key]
         reward -= w_smoothness * vel.pow(2).mean().item()
     return reward / reward_scale
+
+
+class _RunningMoments:
+    """
+    Welford mean/variance, used to put reward terms on a common scale.
+
+    The reprojection term and the discriminator term have no reason to share
+    units: one is a difference of `exp(-e^2/sigma^2)` values in bbox-height
+    space, the other a difference of discriminator probabilities. Picking a
+    weight by hand means guessing that ratio, and guessing it wrong means one
+    term silently sets the policy gradient while the other rounds off. Tracking
+    each term's own standard deviation turns the weight into a statement about
+    *relative influence* instead. See `GymMoviEnv._apply_gail`.
+    """
+
+    __slots__ = ("n", "mean", "m2")
+
+    def __init__(self) -> None:
+        self.n = 0
+        self.mean = 0.0
+        self.m2 = 0.0
+
+    def update(self, x: float) -> None:
+        # nan means the frame carried no 2D evidence, not that it had zero
+        # variance — folding it in would poison the running estimate the same
+        # way it would poison a TensorBoard mean.
+        if x != x:
+            return
+        self.n += 1
+        d = x - self.mean
+        self.mean += d / self.n
+        self.m2 += d * (x - self.mean)
+
+    @property
+    def std(self) -> float:
+        return (self.m2 / (self.n - 1)) ** 0.5 if self.n > 1 else 0.0
 
 
 class GymMoviEnv(gymnasium.Env):
@@ -220,6 +256,9 @@ class GymMoviEnv(gymnasium.Env):
         state_trans: bool = True,
         disc_reward=None,   # GAILRewardProvider instance passed in gail_train.py
         w_gail:       float = 0.0,
+        gail_balance: bool = True,
+        gail_warmup:  int  = 1000,
+        gail_min_std: float = 1e-4,
     ):
         super().__init__()
         self.dataset      = dataset
@@ -283,6 +322,51 @@ class GymMoviEnv(gymnasium.Env):
         self._disc_reward = disc_reward
         self.w_gail = float(w_gail)
 
+        # Two GT channels at once is not experiment (C). `reward_mode="gt"` is
+        # the supervised frame-wise similarity term — it reads `self._y` in
+        # `step()` and scores the corrected pose against that frame's ground
+        # truth. The discriminator is the *only* place GT is supposed to enter
+        # the loop, and it enters distributionally: a bank of unpaired GT poses
+        # (`load_gt_transitions`), never this clip's label at this frame.
+        # Running both means the dense supervised signal swamps the sparse
+        # adversarial one, and the resulting curves answer a different question
+        # than the one (C) asks.
+        #
+        # The condition mirrors `step()`'s own test for an active GAIL term
+        # exactly (`self._disc_reward is not None and self.w_gail`), so the
+        # guard cannot drift from the behaviour it guards: `w_gail=0` with a
+        # discriminator attached is the legitimate infra smoke test — the
+        # discriminator is built and trained but contributes nothing to the
+        # reward — and stays allowed.
+        #
+        # This lives in the env rather than in a trainer because the env is
+        # what actually reads GT. `src/gail_train.py` has its own, stricter
+        # check (experiment (C) requires `reward_mode="reproj"`, full stop),
+        # but that one only protects that entry point; `src/train.py`,
+        # `src/evaluate.py`, `scripts/heldout_eval.py` and any notebook build
+        # this env directly, and the leaking composition is invalid from all
+        # of them.
+        if reward_mode == "gt" and self._disc_reward is not None and self.w_gail:
+            raise ValueError(
+                f"reward_mode='gt' cannot be combined with an active GAIL term "
+                f"(w_gail={self.w_gail}): the supervised similarity reward scores "
+                "the pose against that frame's ground truth, so GT would enter "
+                "through two channels at once and this is no longer experiment "
+                "(C). Use reward_mode='reproj' with w_gail>0 for (C), or keep "
+                "reward_mode='gt' with w_gail=0 for a labelled ablation / infra "
+                "smoke test.")
+
+        # Scale-match the discriminator term to the base reward rather than
+        # trusting `w_gail` to carry both "how important" and "what units".
+        # With this on, w_gail = 1.0 means "contribute as much reward variation
+        # as reprojection + smoothness together"; 0.5 means half as much. Off,
+        # `w_gail` multiplies the raw term, which is the older behaviour.
+        self.gail_balance = bool(gail_balance)
+        self.gail_warmup = int(gail_warmup)
+        self.gail_min_std = float(gail_min_std)
+        self._gail_moments = _RunningMoments()
+        self._base_moments = _RunningMoments()
+
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf,
             shape=(state_dim(use_evidence=self.use_evidence,
@@ -303,6 +387,7 @@ class GymMoviEnv(gymnasium.Env):
                        else NoTransMoviEnv(device=device))
         self._x              = None
         self._y              = None
+        self._camera         = None
         self._t:   int       = 0
         self._T:   int       = 0
         self._prev_poses     = None
@@ -320,6 +405,11 @@ class GymMoviEnv(gymnasium.Env):
         sample       = self.dataset[idx]
         self._x      = sample["x"]
         self._y      = sample["y"]
+        # Which camera's normalisation statistics this clip's lifted poses
+        # carry. The GAIL term needs it to map the corrected pose out of lifted
+        # per-camera space and into the discriminator's GT space
+        # (`src.models.discriminator.PoseSpace`); pg1 and pg2 differ.
+        self._camera = str(sample.get("meta", {}).get("camera", "pg1")).lower()
         self._T      = self._y["poses"].shape[0]
         self._t      = 0
 
@@ -381,9 +471,7 @@ class GymMoviEnv(gymnasium.Env):
         # every episode — see `src/models/discriminator.py`'s module
         # docstring for why the fix was to stop pairing rather than mask it.
         if self._disc_reward is not None and self.w_gail:
-            r_gail = self._disc_reward.score(corrected_poses)
-            reward = reward + self.w_gail * r_gail
-            info["r_gail"] = r_gail
+            reward = self._apply_gail(reward, corrected_poses, info)
 
         self._t += 1
         # Running out of frames is a *time limit*, not a terminal state. Nothing
@@ -402,6 +490,74 @@ class GymMoviEnv(gymnasium.Env):
         self._prev_poses = corrected_poses.clone()
 
         return self._observation(), reward, terminated, truncated, info
+
+    def _apply_gail(self, reward: float, corrected_poses: torch.Tensor,
+                    info: dict) -> float:
+        """
+        Add the discriminator term to the base reward, baselined and scaled.
+
+        Two corrections to the naive `reward + w_gail * r_amp(D(pose))`:
+
+        **Baselined against the lifted pose**, so the term is "did the policy
+        make this pose more plausible than the pose it was handed" rather than
+        "is this pose plausible". The level form carries a large constant the
+        policy cannot influence — the same ~0.68 floor problem fix 05 removed
+        from the reprojection term — and it makes the reward depend on how
+        plausible the *clip* happens to be. Still GT-free: the lifted pose is
+        the policy's own input. Costs one extra discriminator forward, which is
+        a 66->256->128->1 MLP at batch 1, i.e. nothing next to the SMPL-X pass.
+
+        **Scaled to the base reward's standard deviation**, so `w_gail` states
+        relative influence instead of doubling as a unit conversion. The two
+        terms are not commensurable otherwise: the reprojection improvement sits
+        in the low 1e-2, while a discriminator difference is bounded by 1 and
+        can be two orders of magnitude larger, which would leave the base reward
+        contributing nothing to the gradient. Held out entirely until
+        `gail_warmup` samples have accumulated, because a standard deviation
+        estimated from a handful of steps is worse than no scaling at all.
+
+        A saturated discriminator produces a near-constant term; rescaling that
+        would amplify float noise into the reward, so below `gail_min_std` the
+        term is dropped rather than scaled. Watch "GAIL / reward scale factor"
+        going to zero for that case.
+
+        The scale moves as training proceeds, so the reward is non-stationary.
+        PPO already tolerates this (its value preprocessor is a running scaler),
+        but it is a real caveat and the ratio is logged so it can be watched.
+        """
+        r_raw = self._disc_reward.score(corrected_poses, self._camera)
+        info["r_gail_raw"] = r_raw
+
+        g = r_raw
+        if self.reward_baseline:
+            # The lifted pose for *this* frame. `self._inner` has already
+            # advanced its own lifted slot to t+1, so read the clip directly.
+            g = g - self._disc_reward.score(self._x["poses"][self._t], self._camera)
+        info["r_gail"] = g
+
+        if not self.gail_balance:
+            info["r_gail_scaled"] = self.w_gail * g
+            return reward + self.w_gail * g
+
+        self._gail_moments.update(g)
+        self._base_moments.update(reward)
+        sg = self._gail_moments.std
+        # `scale = std(base)/std(gail)` blows up as the discriminator term stops
+        # varying, which is exactly what happens when the discriminator
+        # saturates — and saturation is this experiment's expected failure mode,
+        # not a remote one. Without a floor, a term carrying nothing but
+        # float noise would be amplified to the base reward's full magnitude and
+        # handed to PPO as signal. `amp_reward` is bounded to [0, 1], so the
+        # difference of two of them lives in [-1, 1] and a standard deviation
+        # below `gail_min_std` means "constant" rather than "small"; the term is
+        # dropped instead of rescaled.
+        scale = (self._base_moments.std / sg
+                 if self._gail_moments.n >= self.gail_warmup and sg >= self.gail_min_std
+                 else 0.0)
+        contribution = self.w_gail * scale * g
+        info["r_gail_scaled"] = contribution
+        info["gail_scale"] = scale
+        return reward + contribution
 
     # ── state accessors ──────────────────────────────────────────────────────
     def _corrected(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -557,7 +713,7 @@ def rollout_policy(
     state_trans:   bool  = True,
 ) -> list:
     """
-    Roll a policy over one clip and return the corrected poses, `(52, 3)` each,
+    Roll a policy over one clip and return the corrected poses, `(22, 3)` each,
     still normalised.
 
     **This exists so that training, `src/viz_pose.py` and `src/evaluate.py`

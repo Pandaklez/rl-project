@@ -24,8 +24,21 @@ Two questions, because they have different answers:
    on each side. `--physical` reports the systematic pose error the reward
    would drive toward if the policy satisfied the discriminator perfectly.
 
+3. **`--common_space`: separability in the space the discriminator (C) actually
+   sees.** Questions 1 and 2 both describe the code as it stood *before*
+   `src.models.discriminator.PoseSpace`, which fixed (2) by mapping the fake
+   side into GT-normalised space. That fix necessarily undoes (1)'s answer: the
+   ~50% of question 1 was a consequence of each side being standardised in its
+   own space, and once both sides share one space the classes separate widely.
+   This mode applies `PoseSpace` and reports the same two statistics on the
+   result, so the number is comparable with the discriminator accuracy the (C)
+   runs actually log. `--exclude_joints` matches `gail_train --disc_exclude_joints`
+   (default `0` = global_orient; `0 10 11` also drops the feet, the (C) ablation).
+
     python scripts/disc_separability.py
     python scripts/disc_separability.py --physical
+    python scripts/disc_separability.py --common_space --exclude_joints 0
+    python scripts/disc_separability.py --common_space --exclude_joints 0 10 11
 """
 from __future__ import annotations
 
@@ -34,23 +47,23 @@ import json
 import math
 from pathlib import Path
 
+import sys
+
 import h5py
 import numpy as np
 
 REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
 
-def separability(h5_path: str, split: str) -> None:
-    real, fake = [], []
-    with h5py.File(h5_path, "r") as f:
-        for clip in f[split].keys():
-            grp = f[split][clip]
-            real.append(grp["gt"]["poses"][:].reshape(len(grp["gt"]["poses"]), -1))
-            for cam in ("pg1", "pg2"):
-                if cam in grp:
-                    fake.append(grp[cam]["poses"][:].reshape(len(grp[cam]["poses"]), -1))
-    real = np.concatenate(real).astype(np.float64)
-    fake = np.concatenate(fake).astype(np.float64)
+def _report(real: np.ndarray, fake: np.ndarray) -> None:
+    """The two statistics, on whatever space the caller put the samples in.
+
+    Shared by `separability` (each side in its own normalisation, i.e. what the
+    discriminator saw before `PoseSpace`) and `separability_common` (both sides
+    in GT space, i.e. what it sees now), so the two are measured identically and
+    the numbers are directly comparable.
+    """
     n_dim = real.shape[1]
     print(f"real {real.shape}  fake {fake.shape}")
 
@@ -72,6 +85,87 @@ def separability(h5_path: str, split: str) -> None:
     sat = (np.abs(np.abs(real) - 1.0) < 1e-4).mean(0)
     print(f"worst dim's fraction of real frames at exactly +/-1: {sat.max():.4f} "
           f"(dim {sat.argmax()})")
+
+
+def _load(h5_path: str, split: str) -> tuple[np.ndarray, list[np.ndarray]]:
+    """GT poses, and the lifted poses per camera (kept separate: `PoseSpace.fake`
+    needs to know which camera's statistics a sample carries)."""
+    real, per_cam = [], {c: [] for c in ("pg1", "pg2")}
+    with h5py.File(h5_path, "r") as f:
+        for clip in f[split].keys():
+            grp = f[split][clip]
+            real.append(grp["gt"]["poses"][:].reshape(len(grp["gt"]["poses"]), -1))
+            for cam in ("pg1", "pg2"):
+                if cam in grp:
+                    per_cam[cam].append(
+                        grp[cam]["poses"][:].reshape(len(grp[cam]["poses"]), -1))
+    return (np.concatenate(real),
+            [np.concatenate(per_cam[c]) for c in ("pg1", "pg2") if per_cam[c]])
+
+
+def separability(h5_path: str, split: str) -> None:
+    """Each side in its own normalisation — the pre-`PoseSpace` comparison."""
+    real, per_cam = _load(h5_path, split)
+    _report(real.astype(np.float64), np.concatenate(per_cam).astype(np.float64))
+
+
+def separability_common(h5_path: str, split: str, exclude_joints: tuple[int, ...],
+                        gt_stats: str, lifted_stats: str) -> None:
+    """Both sides in GT-normalised space, via the same `PoseSpace` the (C) runs
+    use — so this is the separability the trained discriminator is up against."""
+    import torch
+
+    from src.models.discriminator import PoseSpace
+
+    space = PoseSpace(gt_stats, lifted_stats, exclude_joints=tuple(exclude_joints))
+    print(f"PoseSpace: {len(space.keep_joints)} joints / {space.dim} dims, "
+          f"excluding {list(space.exclude_joints)}")
+
+    real, per_cam = _load(h5_path, split)
+    real_t = space.real(torch.from_numpy(real.astype(np.float32))).numpy()
+    fake_t = np.concatenate([
+        space.fake(torch.from_numpy(p.astype(np.float32)), cam).numpy()
+        for cam, p in zip(space.CAMERAS, per_cam)])
+    _report(real_t.astype(np.float64), fake_t.astype(np.float64))
+
+
+def joint_sd(h5_path: str, split: str, gt_stats: str, lifted_stats: str) -> None:
+    """Per-joint articulation, GT against lifted, in **physical** axis-angle units.
+
+    Motivates the (C) feet ablation. Both sides are stored normalised, each with
+    its own statistics, so a standard deviation read off the stored values is 1
+    by construction and says nothing; the stats have to be undone first. A joint
+    SMPLer-X regresses toward its conditional mean has a much smaller physical
+    spread than GT, and the discriminator can read that ratio without learning
+    anything about pose plausibility.
+    """
+    g = json.load(open(gt_stats))["poses"]
+    mu_g = np.array(g["mu"]).ravel()
+    sd_g = np.array(g["sigma"]).ravel()
+
+    real, per_cam = _load(h5_path, split)
+    phys_r = real * sd_g + mu_g
+    parts = []
+    for cam, p in zip(("pg1", "pg2"), per_cam):
+        l = json.load(open(lifted_stats.format(cam=cam)))["poses"]
+        parts.append(p * np.array(l["sigma"]).ravel() + np.array(l["mu"]).ravel())
+    phys_f = np.concatenate(parts)
+
+    n_joints = mu_g.size // 3
+    print(f"physical axis-angle sd (rad), {split} split, pooled over both cameras\n")
+    print(f"{'joint':>6}{'GT':>9}{'lifted':>9}{'GT/lifted':>11}")
+    ratios = {}
+    for j in range(n_joints):
+        d = slice(j * 3, j * 3 + 3)
+        r = phys_r[:, d].std(0).mean()
+        f = phys_f[:, d].std(0).mean()
+        ratios[j] = r / f
+        note = "  <- foot" if j in (10, 11) else ""
+        print(f"{j:>6}{r:>9.4f}{f:>9.4f}{r / f:>11.2f}{note}")
+    rest = [j for j in range(1, n_joints) if j not in (10, 11)]
+    print(f"\nfeet (10, 11): {ratios[10]:.2f}x / {ratios[11]:.2f}x")
+    print(f"mean over the other {len(rest)} body joints (excl. global_orient): "
+          f"{np.mean([ratios[j] for j in rest]):.2f}x")
 
 
 def physical(gt_stats: str, lifted_stats: str) -> None:
@@ -106,11 +200,27 @@ def main() -> None:
     ap.add_argument("--gt_stats", default=str(REPO / "data/normalization.json"))
     ap.add_argument("--lifted_stats",
                     default=str(REPO / "data/normalization_lifted_{cam}.json"))
+    ap.add_argument("--common_space", action="store_true",
+                    help="measure in the GT-normalised space PoseSpace maps both "
+                         "sides into, i.e. what the (C) discriminator sees")
+    ap.add_argument("--exclude_joints", type=int, nargs="*", default=[0],
+                    help="joints hidden from the discriminator, matching "
+                         "gail_train --disc_exclude_joints (default: 0)")
+    ap.add_argument("--joint_sd", action="store_true",
+                    help="per-joint GT-vs-lifted articulation in physical rad, "
+                         "the motivation for the feet ablation")
     ap.add_argument("--physical", action="store_true",
                     help="also report the pose error the space mismatch implies")
     args = ap.parse_args()
 
-    separability(args.h5_path, args.split)
+    if args.joint_sd:
+        joint_sd(args.h5_path, args.split, args.gt_stats, args.lifted_stats)
+        return
+    if args.common_space:
+        separability_common(args.h5_path, args.split, tuple(args.exclude_joints),
+                            args.gt_stats, args.lifted_stats)
+    else:
+        separability(args.h5_path, args.split)
     if args.physical:
         physical(args.gt_stats, args.lifted_stats)
 

@@ -32,8 +32,10 @@ from skrl.trainers.torch import SequentialTrainer
 from src.data.datasets import MoViDataset
 from src.gail_env import GymMoviEnv
 from src.models.discriminator import (GAILRewardProvider, MotionDiscriminator,
-                                      discriminator_step, load_gt_transitions)
-from src.models.policy import SkrlPoseActor, SkrlPoseCritic, extract_corrected_pose
+                                      PoseSpace, discriminator_step,
+                                      load_gt_transitions, split_demo_clips)
+from src.models.policy import (SkrlPoseActor, SkrlPoseCritic,
+                               extract_camera_onehot, extract_corrected_pose)
 from src.viz_pose import PoseVizLogger
 
 
@@ -80,8 +82,22 @@ class PPOWithPoseViz(PPO):
             self.track_data("Reward / reprojection", float(info["r_reproj"]))
         if ok(info.get("r_smooth")):
             self.track_data("Reward / smoothness", float(info["r_smooth"]))
+        # Three GAIL curves, because they answer different questions:
+        #   raw     — is the discriminator fooled at all (0 = never)
+        #   improvement — is the corrected pose more plausible than its input
+        #   scaled  — what the reward actually received, after balancing
+        if ok(info.get("r_gail_raw")):
+            self.track_data("Reward / GAIL raw sigmoid(D)", float(info["r_gail_raw"]))
         if ok(info.get("r_gail")):
-            self.track_data("Reward / GAIL (discriminator)", float(info["r_gail"]))
+            self.track_data("Reward / GAIL improvement over lifted",
+                            float(info["r_gail"]))
+        if ok(info.get("r_gail_scaled")):
+            self.track_data("Reward / GAIL contribution (scaled)",
+                            float(info["r_gail_scaled"]))
+        if ok(info.get("gail_scale")):
+            # std(base) / std(gail). Watch this: if it collapses toward 0 the
+            # discriminator term has saturated and stopped varying.
+            self.track_data("GAIL / reward scale factor", float(info["gail_scale"]))
         if ok(info.get("err_px")):
             self.track_data("Reprojection / error corrected (px)", float(info["err_px"]))
             self.track_data("Reprojection / joints scored", float(info.get("n_joints", 0)))
@@ -176,11 +192,16 @@ class PPOWithGAIL(PPOWithPoseViz):
 
     def __init__(self, *args, discriminator: MotionDiscriminator,
                  disc_optimizer: torch.optim.Optimizer, real_bank: torch.Tensor,
-                 state_trans: bool = True, disc_updates: int = 4,
-                 disc_batch_size: int = 1024, disc_grad_penalty: float = 5.0,
+                 space, state_trans: bool = True, disc_updates: int = 4,
+                 disc_batch_size: int = 1024, disc_grad_penalty: float = 50.0,
+                 probe_bank: torch.Tensor | None = None,
                  **kwargs):
         super().__init__(*args, **kwargs)
         self.discriminator    = discriminator
+        self.space            = space
+        # GT from clips held out of the bank but not out of the policy's
+        # sampler. Scored, never trained on — see Config.demo_probe_frac.
+        self.probe_bank       = probe_bank
         self.disc_optimizer   = disc_optimizer
         # Kept on whatever device it was built on (see gail_train.train —
         # typically CPU, to leave GPU memory for the PPO batch); sampled
@@ -209,9 +230,16 @@ class PPOWithGAIL(PPOWithPoseViz):
         fresh[1:] = done[:-1]
         valid = (~fresh).reshape(-1)
 
-        fake_poses = extract_corrected_pose(
-            states.reshape(-1, obs_dim)[valid], self.state_trans)
-        fake_poses = fake_poses.to(device).detach()
+        rows = states.reshape(-1, obs_dim)[valid]
+        # The corrected pose is normalised in **lifted per-camera** space, so it
+        # has to be mapped into the discriminator's GT space before it can be
+        # compared with the real bank — and the mapping is per camera, which is
+        # why the camera one-hot is read back out of the same row. Before this,
+        # the fake batch was a mixture of two differently-normalised spaces
+        # being scored against a third. See `PoseSpace`.
+        cams = extract_camera_onehot(rows, self.state_trans).argmax(-1)
+        fake_poses = self.space.fake(
+            extract_corrected_pose(rows, self.state_trans), cams).to(device).detach()
 
         n_fake = fake_poses.shape[0]
         n_real = self.real_bank.shape[0]
@@ -242,6 +270,23 @@ class PPOWithGAIL(PPOWithPoseViz):
         self.track_data("GAIL / Discriminator accuracy (real)", totals["acc_real"] / n)
         self.track_data("GAIL / Discriminator accuracy (fake)", totals["acc_fake"] / n)
         self.track_data("GAIL / Discriminator gradient penalty", totals["grad_penalty"] / n)
+
+        # Memorisation diagnostic. `acc_real` is measured on GT the
+        # discriminator trains on; `acc_probe` on GT from clips it has never
+        # seen, which the policy nonetheless rolls out. If the shared-clip bank
+        # were letting it memorise, the first would rise above the second and
+        # stay there. Equal accuracies are the evidence that it is not.
+        if self.probe_bank is not None and len(self.probe_bank):
+            with torch.no_grad():
+                self.discriminator.eval()
+                idx = torch.randint(0, self.probe_bank.shape[0],
+                                    (min(self.disc_batch_size, self.probe_bank.shape[0]),))
+                acc_probe = (self.discriminator(
+                    self.probe_bank[idx].to(device)) > 0).float().mean().item()
+                self.discriminator.train()
+            self.track_data("GAIL / Discriminator accuracy (probe, unseen GT)", acc_probe)
+            self.track_data("GAIL / Memorisation gap (bank - probe)",
+                            totals["acc_real"] / n - acc_probe)
 
     def post_interaction(self, timestep: int, timesteps: int) -> None:
         updating = (not (self._rollout + 1) % self._rollouts
@@ -280,7 +325,7 @@ class Config:
     #
     # **Not skrl's default 0.008.** For two Gaussians with a shared sigma the KL
     # is `(D/2)·(dmu/sigma)²`, so the trust region a threshold buys depends on
-    # the action dimension and on sigma — and this policy is extreme in both: 156
+    # the action dimension and on sigma — and this policy is extreme in both: 66
     # dims and sigma = 0.05, twenty times smaller than a typical continuous-
     # control policy because the action is a residual around an already-good
     # pose. At 0.008 one update may move the mean by 1.0% of sigma, which is
@@ -288,8 +333,11 @@ class Config:
     # floors the learning rate at skrl's min_lr of 1e-6 within three updates and
     # learning stops.
     #
-    # 0.05 corresponds to 2.5% of sigma per update — still a tight trust region,
-    # but one an Adam step at 1e-4 can actually stay inside.
+    # 0.05 corresponds to 3.9% of sigma per update at the current 66 action dims
+    # — still a tight trust region, but one an Adam step at 1e-4 can actually stay
+    # inside. It was 2.5% at the old 156 dims: the same threshold buys a slightly
+    # wider step now, because the KL scales with D and the pose vector lost its
+    # 90 finger dimensions.
     kl_threshold:       float = 0.05
 
     # Reward weights
@@ -305,6 +353,7 @@ class Config:
     # is "add a discriminator on top of (B)", not on top of the GT-similarity
     # ablation, and the GAIL term below stacks on whichever base reward this
     # selects.
+    # Not a choice in experiment (C): see the guard at the top of train().
     reward_mode:  str   = "reproj"
     reproj_path:  str   = "data/reproj_targets.h5"
     w_reproj:     float = 1.0
@@ -339,6 +388,35 @@ class Config:
     # identically to src/train.py (modulo the "reproj" default above) and is
     # the ablation to compare (C) against (B).
     w_gail:            float = 0.5
+    # Fraction of train clips withheld from the policy's sampler and reserved
+    # for the discriminator's real bank.
+    #
+    # **Default 0 — measured, not assumed.** A disjoint bank is the textbook
+    # AMP/GAIL arrangement, but here it costs more than it buys. The signal the
+    # discriminator is meant to learn (GT vs corrected, in a common space) is
+    # weak, while *any* clip-level partition introduces a distribution shift it
+    # can exploit instead: holding out 20% of train clips holds out specific
+    # actions, and best-linear separability of held-out-clip GT from
+    # policy-clip lifted is d' = 0.36 against d' = 0.06 for the full-overlap
+    # bank. The leak a disjoint bank closes needs per-clip memorisation by a
+    # 50k-parameter MLP over ~954k poses, which is not that capacity regime.
+    #
+    # demo_frac=0 also keeps the policy on 100% of train, so (C) is trained on
+    # exactly the clips the (B) runs in report.md used. Use `demo_probe_frac`
+    # to measure memorisation instead of partitioning against it.
+    demo_frac:         float = 0.0
+    # Its own seed, not the run seed: a partition that moved with the run seed
+    # would confound partition variance with policy variance across a sweep.
+    demo_seed:         int   = 0
+    # Clips held out of the **bank only** — the policy still rolls out on them.
+    # Pure diagnostic: the discriminator's accuracy on these is logged next to
+    # its accuracy on bank clips, and a persistent gap is what memorisation
+    # would look like. Costs the policy nothing. 0 disables.
+    demo_probe_frac:   float = 0.05
+    # Joints the discriminator does not see. 0 is `global_orient` — where the
+    # subject faced, not whether the pose is plausible, and the single largest
+    # contributor to the space mismatch. See PoseSpace.
+    disc_exclude_joints: tuple = (0,)
     disc_hidden_dims:  tuple = (256, 128)
     disc_lr:           float = 3e-4
     # Discriminator gradient steps per PPO rollout. More steps track the
@@ -347,10 +425,38 @@ class Config:
     # `discriminator_step`'s gradient penalty is there to slow down.
     disc_updates:      int   = 4
     disc_batch_size:   int   = 1024
-    # R1 gradient penalty weight on real samples (src/models/discriminator.py).
-    # 0 disables it — useful as an ablation to see the accuracy-saturation
-    # failure mode directly, not a setting to train with.
-    disc_grad_penalty: float = 5.0
+    # R1 gradient penalty on real samples (src/models/discriminator.py); 0
+    # disables it, useful as an ablation to see the saturation failure directly.
+    # Raised from 5.0 after measuring the
+    # actual saturation schedule: 160 discriminator steps (40 rollouts x 4) at
+    # batch 1024, real = GT bank, fake = lifted mapped through PoseSpace.
+    #
+    #     R1     @10 steps   @160 steps   final acc_fake
+    #       5      96.7%       99.7%          99.4%
+    #      50      97.2%       98.6%          97.3%
+    #     250      94.9%       98.5%          97.1%
+    #
+    # 50 is where the curve flattens. **Read that table before relying on it:**
+    # R1 buys about one point of accuracy, not a slow discriminator. It cannot,
+    # because the two classes really are far apart in a common space (LDA
+    # d' = 8.3 at these exclusions) — SMPLer-X regresses toward the conditional
+    # mean, so its pose distribution is systematically narrower than GT's, and
+    # no smoothness penalty hides a variance gap that large. Excluding the worst
+    # joints only softens it (d' = 5.9 without the feet, 4.4 without feet,
+    # ankles and neck). If the saturated-discriminator failure has to be fixed
+    # rather than delayed, it needs a reward that stays graded when D is
+    # confident, not a bigger penalty here.
+    disc_grad_penalty: float = 50.0
+    # Put the discriminator term on the same scale as the base reward, so
+    # `w_gail` means relative influence rather than doubling as a unit
+    # conversion. See GymMoviEnv._apply_gail.
+    gail_balance:      bool  = True
+    # Steps of reward statistics to collect before the term is switched on. A
+    # standard deviation from a handful of samples is worse than no scaling.
+    gail_warmup:       int   = 1000
+    # Below this, the discriminator term is treated as constant and dropped
+    # rather than rescaled — see GymMoviEnv._apply_gail.
+    gail_min_std:      float = 1e-4
 
     # Translation (§2). The lifted `trans` is virtual-camera depth, not metres,
     # so it is never corrected as a normalised delta — it is passed through, and
@@ -393,15 +499,55 @@ def train(cfg: Config) -> None:
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32       = False
 
+    # Experiment (C) is "(B)'s reward plus a discriminator", and (B)'s reward is
+    # ground-truth-free by definition. `reward_mode="gt"` is the supervised RMSE
+    # similarity term: it reads `self._y` in src/gail_env.py and scores the pose
+    # against the ground truth for that very frame. Running (C) on it produces a
+    # number that cannot be compared with (A) or (B) and cannot answer the
+    # research question, which asks for correction *without* 3D labels.
+    #
+    # This is an easy mistake to make rather than a hypothetical: `reproj`
+    # requires data/reproj_targets.h5, which requires ViTPose 2D keypoints, so on
+    # a machine without that stack `--reward_mode gt` is the only mode that runs.
+    # Failing loudly here is the difference between a missing run and a silently
+    # invalid one.
+    if cfg.reward_mode != "reproj":
+        raise ValueError(
+            f"reward_mode={cfg.reward_mode!r} is not valid for experiment (C). "
+            "'gt' is a supervised objective — it scores the corrected pose "
+            "against that frame's ground truth — so it leaks the labels the "
+            "experiment is defined to work without. Experiment (C) is (B)'s "
+            "GT-free reprojection + smoothness reward with a discriminator term "
+            "added, i.e. reward_mode='reproj'.\n"
+            "That needs data/reproj_targets.h5 (scripts/extract_2d.py then "
+            "scripts/build_reproj_targets.py, both requiring ViTPose). If you "
+            "cannot build it on this machine, run src/train.py --reward_mode gt "
+            "as a labelled ablation instead — but do not report it as (C).")
+
     device = torch.device(cfg.device)
     Path(cfg.out_dir).mkdir(parents=True, exist_ok=True)
     print(f"Device: {device}")
 
     # ── Dataset & env ────────────────────────────────────────────────────────
     use_reproj = cfg.reward_mode == "reproj"
+    # Disjoint demonstration set: the discriminator's GT bank comes from clips
+    # the policy never rolls out, so it cannot reward the policy for
+    # reproducing the ground truth of the clip it is currently correcting.
+    # `demo_frac=0` returns the same list twice, i.e. the older overlapping
+    # behaviour, and the print below says which one is in force.
+    policy_clips, demo_clips = split_demo_clips(
+        cfg.h5_path, split="train", demo_frac=cfg.demo_frac, seed=cfg.demo_seed)
     dataset = MoViDataset(cfg.h5_path, cfg.norm_stats_path, split="train", verbose=False,
-                          reproj_path=cfg.reproj_path if use_reproj else None)
+                          reproj_path=cfg.reproj_path if use_reproj else None,
+                          clips=policy_clips if cfg.demo_frac else None)
     print(f"Train samples: {len(dataset)}")
+    if cfg.demo_frac:
+        print(f"Demo split: {len(policy_clips)} policy clips / {len(demo_clips)} "
+              f"discriminator clips, disjoint (demo_frac={cfg.demo_frac}, "
+              f"demo_seed={cfg.demo_seed})")
+    else:
+        print(f"Demo split: none — discriminator and policy share all "
+              f"{len(policy_clips)} train clips (demo_frac=0)")
 
     reproj_reward = None
     if use_reproj:
@@ -427,12 +573,46 @@ def train(cfg: Config) -> None:
     # provider wrapping it (`GAILRewardProvider`) — see src/gail_env.py and
     # src/models/discriminator.py for why that reference is what lets the
     # reward track training without the env changing.
-    discriminator = MotionDiscriminator(hidden_dims=cfg.disc_hidden_dims).to(device)
+    # One space for both sides. Without it the discriminator compares GT-space
+    # real samples against lifted-per-camera-space fakes, which is a
+    # well-behaved comparison of two different physical quantities — see
+    # `src.models.discriminator.PoseSpace`.
+    space = PoseSpace(cfg.norm_stats_path, exclude_joints=cfg.disc_exclude_joints,
+                      device=cfg.device)
+    print(f"GAIL space: {len(space.keep_joints)} joints / {space.dim} dims "
+          f"(excluding {list(space.exclude_joints)}), fakes remapped to GT space")
+
+    discriminator = MotionDiscriminator(hidden_dims=cfg.disc_hidden_dims,
+                                        pose_dim=space.dim).to(device)
     disc_optimizer = torch.optim.Adam(discriminator.parameters(), lr=cfg.disc_lr)
-    real_bank = load_gt_transitions(cfg.h5_path, split="train", device="cpu")
+
+    # Probe clips are held out of the bank but NOT out of the policy's sampler:
+    # they exist only so the discriminator's accuracy on GT it has never been
+    # trained on can be compared against its accuracy on GT it has. A gap that
+    # opens and stays open is memorisation; no gap is evidence the shared-clip
+    # bank is not leaking. See Config.demo_probe_frac.
+    bank_clips = demo_clips if cfg.demo_frac else None
+    probe_bank = None
+    if cfg.demo_probe_frac:
+        pool = bank_clips if bank_clips is not None else policy_clips
+        keep, probe = split_demo_clips(cfg.h5_path, split="train",
+                                       demo_frac=cfg.demo_probe_frac,
+                                       seed=cfg.demo_seed + 1)
+        probe = [c for c in probe if c in set(pool)]
+        bank_clips = [c for c in pool if c not in set(probe)]
+        probe_bank = space.real(load_gt_transitions(
+            cfg.h5_path, split="train", device="cpu", clips=probe))
+        print(f"GAIL probe: {len(probe)} clips / {probe_bank.shape[0]:,} GT poses "
+              f"held out of the bank for the memorisation diagnostic only "
+              f"(the policy still trains on them)")
+
+    real_bank = space.real(load_gt_transitions(cfg.h5_path, split="train",
+                                               device="cpu", clips=bank_clips))
     print(f"GAIL: discriminator {sum(p.numel() for p in discriminator.parameters()):,} params, "
-          f"real bank {real_bank.shape[0]:,} GT transitions, w_gail={cfg.w_gail}")
-    disc_reward = GAILRewardProvider(discriminator, device=cfg.device)
+          f"real bank {real_bank.shape[0]:,} GT transitions from "
+          f"{len(demo_clips) if cfg.demo_frac else len(policy_clips)} clips, "
+          f"w_gail={cfg.w_gail}")
+    disc_reward = GAILRewardProvider(discriminator, device=cfg.device, space=space)
 
     gym_env = GymMoviEnv(
         dataset,
@@ -450,6 +630,9 @@ def train(cfg: Config) -> None:
         state_trans=cfg.state_trans,
         disc_reward=disc_reward,
         w_gail=cfg.w_gail,
+        gail_balance=cfg.gail_balance,
+        gail_warmup=cfg.gail_warmup,
+        gail_min_std=cfg.gail_min_std,
     )
     _TRANS_DESC = {"none": "poses only, translation frozen",
                    "uv":   "poses + du,dv image shift (log-depth frozen)",
@@ -593,6 +776,8 @@ def train(cfg: Config) -> None:
         discriminator=discriminator,
         disc_optimizer=disc_optimizer,
         real_bank=real_bank,
+        space=space,
+        probe_bank=probe_bank,
         state_trans=cfg.state_trans,
         disc_updates=cfg.disc_updates,
         disc_batch_size=cfg.disc_batch_size,
@@ -652,16 +837,30 @@ def main() -> None:
     parser.add_argument("--grad_norm_clip",      type=float, default=0.5)
     parser.add_argument("--kl_threshold",        type=float, default=0.05,
                         help="target KL for the adaptive learning-rate scheduler "
-                             "(0 disables it). Not skrl's 0.008: at 156 action "
+                             "(0 disables it). Not skrl's 0.008: at 66 action "
                              "dims and sigma=0.05 that allows a mean step of 1%% "
                              "of sigma and floors the learning rate in three "
                              "updates. See Config.kl_threshold.")
     parser.add_argument("--w_similarity",        type=float, default=1.0)
     parser.add_argument("--w_smoothness",        type=float, default=0.1)
     parser.add_argument("--reward_scale",        type=float, default=10.0)
-    parser.add_argument("--reward_mode",         choices=("gt", "reproj"), default="reproj",
-                        help="base reward the GAIL term stacks on top of; "
-                             "'reproj' is experiment (C)'s intended setting")
+    parser.add_argument("--reward_mode",         choices=("reproj",), default="reproj",
+                        help="base reward the GAIL term stacks on top of. Only "
+                             "'reproj' is accepted: 'gt' is a supervised "
+                             "objective and would leak ground truth into (C). "
+                             "It remains available in src/train.py for ablations.")
+    parser.add_argument("--no_gail_balance",     dest="gail_balance",
+                        action="store_false",
+                        help="multiply the raw discriminator term by --w_gail "
+                             "instead of scale-matching it to the base reward. "
+                             "The two are not in the same units, so this "
+                             "usually means one term dominates.")
+    parser.add_argument("--gail_warmup",         type=int, default=1000,
+                        help="reward-statistics samples to collect before the "
+                             "discriminator term is switched on")
+    parser.add_argument("--gail_min_std",        type=float, default=1e-4,
+                        help="discriminator-term std below which the term is "
+                             "dropped as constant instead of rescaled")
     parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
     parser.add_argument("--w_reproj",            type=float, default=1.0)
     parser.add_argument("--reproj_sigma",        type=float, default=0.0225,
@@ -671,7 +870,7 @@ def main() -> None:
                         help="per-joint COCO<->SMPL-X offset from "
                              "scripts.fit_kp_bias; empty string disables it")
     parser.add_argument("--trans_mode", choices=("none", "uv", "uvz"), default="none",
-                        help="translation action. 'none' (156-d) freezes it. 'uv' "
+                        help="translation action. 'none' (66-d) freezes it. 'uv' "
                              "(158-d) lets the policy shift the body in the image "
                              "plane in bbox-height units — the coordinates the "
                              "reprojection reward is actually sensitive in — with "
@@ -700,13 +899,30 @@ def main() -> None:
     parser.add_argument("--w_gail",              type=float, default=0.5,
                         help="weight of the discriminator's reward term, "
                              "additive on top of --reward_mode's reward")
+    parser.add_argument("--demo_frac",           type=float, default=0.0,
+                        help="fraction of train clips reserved for the "
+                             "discriminator's real bank and withheld from the "
+                             "policy's sampler (disjoint demonstration set); "
+                             "0 shares all clips, the older behaviour")
+    parser.add_argument("--demo_probe_frac",     type=float, default=0.05,
+                        help="clips held out of the discriminator's bank but "
+                             "NOT of the policy's sampler, purely to log a "
+                             "memorisation gap; 0 disables")
+    parser.add_argument("--demo_seed",           type=int,   default=0,
+                        help="seed for the demo/policy clip partition; separate "
+                             "from --seed so a seed sweep does not also resample "
+                             "the partition")
     # disc_hidden_dims is Config-only, like the actor/critic's hidden_dims —
     # architecture, not a run-to-run sweep knob.
     parser.add_argument("--disc_lr",             type=float, default=3e-4)
     parser.add_argument("--disc_updates",        type=int,   default=4,
                         help="discriminator gradient steps per PPO rollout")
     parser.add_argument("--disc_batch_size",     type=int,   default=1024)
-    parser.add_argument("--disc_grad_penalty",   type=float, default=5.0,
+    parser.add_argument("--disc_exclude_joints", type=int, nargs="*", default=[0],
+                        help="joint indices the discriminator does not see. 0 is "
+                             "global_orient; 10/11 are the feet, which SMPLer-X "
+                             "predicts near-constant while GT articulates them")
+    parser.add_argument("--disc_grad_penalty",   type=float, default=50.0,
                         help="R1 gradient penalty weight on real samples; 0 disables "
                              "it (see src/models/discriminator.py)")
     parser.add_argument("--total_updates",       type=int,   default=3000)
