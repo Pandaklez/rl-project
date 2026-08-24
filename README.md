@@ -118,3 +118,7 @@ python -m src.evaluate --processed_h5 data/processed_movi.h5 \
 # tests  (pyproject sets body_visualizer coverage flags, so override addopts)
 python -m pytest tests/test_reproject.py tests/test_rewards.py -o addopts=""
 ```
+
+## Acknowledgements
+
+This repo has a stale of copy of SMPLer-X repo https://github.com/MotrixLab/SMPLer-X for ease of running the code in folder `smpler-x-main/`. One can also just use this code as a lib instead of copying it as a folder. We thank the authors of this project for making their code publicly available for everyone to use!
