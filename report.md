@@ -152,26 +152,41 @@ dimensions had sigma ~1e-7 and normalised to exactly ±1 where SMPLer-X's
 predicted fingers never did, and the rule "are all 90 hand dims ±1?" separated
 real from fake at 100.0%.
 
-**The finger removal closed that leak, and what remains is much smaller.**
-Re-measured on the current 22-joint `data/processed_movi.h5` (both stats files
-now report `_n_joints: 22`), no dimension saturates — at most 0.01% of real
-frames sit at exactly ±1 in any single dim. Per-dimension separation
-`d' = |mu_r - mu_f| / sqrt((sd_r^2 + sd_f^2)/2)` averages **0.079** over the 66
-dims, and only **one** dim exceeds 1.0: the **root**, at `d' = 1.50`. That one is
-expected and mechanical — the GT stats are `_root_corrected: false` while the
-lifted per-camera stats are `true`, so the two spaces disagree on the root
-convention. The 63 non-root dims average `d' = 0.056` and top out at 0.233.
+**The finger removal closed that leak.** Re-measured on the current 22-joint
+`data/processed_movi.h5`, no dimension saturates — at most 0.01% of real frames
+sit at exactly ±1 in any single dim. Per-dimension separation
+`d' = |mu_r - mu_f| / sqrt((sd_r^2 + sd_f^2)/2)` averages **0.005** over the 66
+dims and never exceeds 0.02, and the best *linear* rule — which bounds the whole
+family, not one dimension at a time — reaches `d' = 0.06`, or **51.2%**
+accuracy against 50% chance. The "discriminator saturates immediately and
+`r_gail` sits at a constant" prediction is **withdrawn**: on this data there is
+no trivial rule left to find.
 
-So the "discriminator saturates immediately and `r_gail` sits at a constant"
-prediction is **no longer supported**, and the pre-run fix is now narrow: put the
-root on a common convention before training (C). This measures single dimensions
-only — an MLP can combine 66 weak ones — so it bounds the trivial rules, not the
-discriminator.
+**But the two spaces still do not mean the same thing, and standardisation
+hides it.** Both sides are stored already-normalised — GT with the GT stats,
+lifted with the per-camera stats — so each has mean 0 and sd 1 in its own space
+and the marginals match by construction. That is why `d'` is ~0. It is not
+evidence the spaces agree: the same coordinate denotes a *different physical
+pose* on each side, because the two affine maps differ (per-joint sd ratios run
+0.12 to 3.22, median 0.68). A latent that is realistic in GT space denotes
+`mu_gt + sd_gt * z`, while the policy emitting that latent in lifted space
+produces `mu_lifted + sd_lifted * z`. **If the policy satisfied this
+discriminator perfectly it would be driven to a pose wrong by 0.088 rad RMS per
+axis-angle component — 5.1°, against a GT spread of 12.6° — and by 31° on the
+root.** So the risk for (C) is not a saturated discriminator any more; it is a
+well-behaved discriminator rewarding the wrong pose. Put both sides in one
+space before running (C).
 
 **Reproduce.**
 ```bash
-python scripts/disc_separability.py
+python scripts/disc_separability.py --physical
 ```
+
+> Both poses in `data/processed_movi.h5` are stored **already normalised**.
+> Re-applying `data/normalization*.json` to them normalises twice and
+> manufactures a mismatch the discriminator never sees — an earlier version of
+> this section did exactly that and reported a spurious root-dimension
+> separation of `d' = 1.50`.
 
 **RMSE, corrected vs GT (normalised pose units).** Root-mean-square error between
 the corrected and ground-truth pose vectors. This is a **diagnostic only** for
