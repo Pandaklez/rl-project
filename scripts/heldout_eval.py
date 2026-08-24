@@ -56,7 +56,9 @@ from src.viz_pose import ImagePoseVizLogger
 VARIANTS = {"frozen": "(B1) frozen", "uv": "(B2) du,dv", "notrans": "(B3) pose-only",
             # (C) feet ablation, under checkpoints/gail_c; absent from a (B)
             # run set, where the table loop simply skips them.
-            "feet_in": "(C) GAIL, feet in", "feet_out": "(C) GAIL, feet out"}
+            "feet_in": "(C) GAIL, feet in", "feet_out": "(C) GAIL, feet out",
+            # (D) supervised-MSE arms, under checkpoints/exp_d.
+            "mse1": "(D) MSE, w=1", "mse10": "(D) MSE, w=10"}
 
 
 def evaluate_one(ckpt_path: Path, h5: str, norm: str, n_clips: int,

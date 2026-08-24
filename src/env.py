@@ -190,6 +190,12 @@ class GymMoviEnv(gymnasium.Env):
     * `reward_mode="reproj"` — reprojection + smoothness, using no ground truth
       (`src/rewards.py`). This is the reward experiment (B) calls for. It needs
       the dataset to have been built with `reproj_path=`.
+
+    `w_mse > 0` adds a **third** term to the `reproj` mode: the mean squared
+    error between the corrected pose and the ground-truth pose of the same
+    frame. That is experiment (D), and it makes the reward **supervised** —
+    `reward_mode="reproj"` is GT-free only at `w_mse = 0`, which is the default
+    and is what (A)/(B)/(C) run at. See `_reproj_step`.
     """
 
     metadata = {"render_modes": []}
@@ -205,6 +211,7 @@ class GymMoviEnv(gymnasium.Env):
         reward_mode:  str   = "gt",
         reproj_reward=None,  #  ReprojectionReward instance passed in train.py
         w_reproj:     float = 1.0,
+        w_mse:        float = 0.0,
         baseline_every: int = 1,
         trans_mode: str = TRANS_MODE_NONE,
         reward_baseline: bool = True,
@@ -228,6 +235,23 @@ class GymMoviEnv(gymnasium.Env):
         self.reward_scale = reward_scale
         self.reward_mode  = reward_mode
         self.w_reproj     = w_reproj
+
+        # Experiment (D). Weight on the supervised MSE-to-GT term inside the
+        # reprojection reward; 0 disables it and reproduces (B) exactly, which
+        # is why it defaults to 0 rather than to a "sensible" value. Kept as its
+        # own weight rather than folded into `w_similarity` because that one
+        # belongs to `reward_mode="gt"`, is an RMSE not an MSE, and also scores
+        # `trans`.
+        self.w_mse = float(w_mse)
+        if self.w_mse < 0:
+            raise ValueError(f"w_mse must be >= 0, got {w_mse}")
+        if self.w_mse and reward_mode != "reproj":
+            raise ValueError(
+                f"w_mse={w_mse} needs reward_mode='reproj' (got {reward_mode!r}). "
+                "Experiment (D) is (B) plus an MSE term; under reward_mode='gt' "
+                "the supervised similarity term is already the whole reward, and "
+                "stacking the two would be two GT channels at once.")
+
         # Scoring the *unmodified* lifted frame alongside the corrected one is the
         # only way to see whether the policy is actually improving the fit rather
         # than just collecting a high reward the lifted pose already earned.
@@ -455,7 +479,15 @@ class GymMoviEnv(gymnasium.Env):
     def _reproj_step(self, corrected_poses: torch.Tensor,
                      corrected_trans: torch.Tensor) -> tuple[float, dict]:
         """
-        Reprojection + smoothness, no ground truth involved.
+        Reprojection + smoothness — and, at `w_mse > 0`, a supervised MSE term.
+
+        **At the default `w_mse = 0` no ground truth is read on this path**, which
+        is what makes it the reward for (A)/(B)/(C). Experiment (D) sets
+        `w_mse > 0` and deliberately gives that up: the third term is the mean
+        squared error between the corrected pose and the GT pose of the *same*
+        frame, so (D) answers "does supervision help?" rather than "can this be
+        learned without labels?". The `if self.w_mse` guard below is the only
+        place GT enters, so a run with `w_mse = 0` is bit-identical to (B).
 
         `corrected_trans` is passed in rather than read off the state, because
         under `state_trans=False` it is not in the state at all — the whole point
@@ -497,17 +529,56 @@ class GymMoviEnv(gymnasium.Env):
             info["err_px_lifted"] = base["err_px"]
 
         if not self.reward_baseline:
-            return combine(r_proj, smooth, self.w_reproj, self.w_smoothness), info
+            r = combine(r_proj, smooth, self.w_reproj, self.w_smoothness)
+        else:
+            # Fix 05. Both terms are differenced against the lifted pose, so the
+            # reward is improvement rather than level: a clip that is inherently
+            # well-detected or inherently smooth no longer pays more than one that
+            # is not, and the ~0.68 floor the policy cannot influence drops out.
+            # `combine` falls back to the smoothness term alone when either
+            # projection is missing, so an undetected frame contributes no
+            # spurious improvement.
+            r = combine(r_proj - r_base,
+                        smooth - self._lifted_smoothness(t),
+                        self.w_reproj, self.w_smoothness)
 
-        # Fix 05. Both terms are differenced against the lifted pose, so the
-        # reward is improvement rather than level: a clip that is inherently
-        # well-detected or inherently smooth no longer pays more than one that is
-        # not, and the ~0.68 floor the policy cannot influence drops out. `combine`
-        # falls back to the smoothness term alone when either projection is
-        # missing, so an undetected frame contributes no spurious improvement.
-        return combine(r_proj - r_base,
-                       smooth - self._lifted_smoothness(t),
-                       self.w_reproj, self.w_smoothness), info
+        return self._apply_mse(r, corrected_poses, t, info), info
+
+    def _apply_mse(self, reward: float, corrected_poses: torch.Tensor,
+                   t: int, info: dict) -> float:
+        """
+        Experiment (D)'s third term: `-w_mse * MSE(corrected_t, gt_t)`.
+
+        Added **outside** `combine`, deliberately. `combine` exists to fall back
+        when a frame has no 2D evidence, and GT has nothing to do with the
+        detector — every frame has a GT pose, so the supervised term is scored on
+        frames the reprojection term skips. Folding it into `combine` would have
+        made it inherit an unrelated fallback.
+
+        Baselined against the *lifted* pose's MSE on the same frame when
+        `reward_baseline` is on, matching the other two terms. This is a pure
+        variance reduction and not a change of objective: `MSE(lifted_t, gt_t)`
+        does not depend on the action, so subtracting it shifts the reward by a
+        per-frame constant and leaves the argmax untouched. What it buys is the
+        same thing fix 05 bought — the term reads as "did the policy get closer
+        to GT than the pose it was handed" rather than carrying a large per-clip
+        offset the policy cannot move.
+        """
+        if not self.w_mse:
+            return reward
+
+        gt_t = self._y["poses"][t].to(corrected_poses.device)
+        mse = float((corrected_poses - gt_t).pow(2).mean())
+        info["r_mse"] = mse
+
+        if not self.reward_baseline:
+            return reward - self.w_mse * mse
+
+        mse_lifted = float((self._x["poses"][t].to(gt_t.device) - gt_t).pow(2).mean())
+        info["r_mse_lifted"] = mse_lifted
+        # Positive = the corrected pose is closer to GT than its input was.
+        info["r_mse_improvement"] = mse_lifted - mse
+        return reward - self.w_mse * (mse - mse_lifted)
 
 
 # ─── Shared rollout ───────────────────────────────────────────────────────────

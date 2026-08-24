@@ -51,7 +51,6 @@ VARIANTS = {"frozen": "(B1) frozen", "uv": "(B2) du,dv", "notrans": "(B3) pose-o
 # for `checkpoints/sweep/gail_*` and coming back empty.
 GAIL_VARIANTS = {"gail_feet_in": "(C) PPO + GAIL, feet in",
                  "gail_feet_out": "(C) PPO + GAIL, feet out"}
-PAMPJPE_VARIANTS = {**VARIANTS, **GAIL_VARIANTS}
 
 # The same two (C) arms as `GAIL_VARIANTS`, keyed by their **run directory**
 # name under `checkpoints/gail_c/` rather than by their `eval_scores/` dump
@@ -59,7 +58,18 @@ PAMPJPE_VARIANTS = {**VARIANTS, **GAIL_VARIANTS}
 # read run directories, so they key off this; `table_pampjpe` reads dumps and
 # keys off `GAIL_VARIANTS`.
 GAIL_RUNS = {"feet_in": "(C) GAIL, feet in", "feet_out": "(C) GAIL, feet out"}
-RUN_LABELS = {**VARIANTS, **GAIL_RUNS}
+
+# Experiment (D): (B3) pose-only plus a supervised MSE-to-GT reward term, at two
+# weights. Same two-names-on-disk split as (C) above -- `D_VARIANTS` keys are
+# `eval_scores/` dump prefixes, `D_RUNS` keys are run directories under
+# `checkpoints/exp_d/`.
+D_VARIANTS = {"d_mse1": "(D) PPO + MSE, w=1", "d_mse10": "(D) PPO + MSE, w=10"}
+D_RUNS = {"mse1": "(D) MSE, w=1", "mse10": "(D) MSE, w=10"}
+
+# Dump-prefix lookup for `table_pampjpe`; run-directory lookup for the tables
+# that read checkpoints and event files.
+PAMPJPE_VARIANTS = {**VARIANTS, **GAIL_VARIANTS, **D_VARIANTS}
+RUN_LABELS = {**VARIANTS, **GAIL_RUNS, **D_RUNS}
 
 # GAIL-only rollout scalars. Absent from every (B) event file, so anything
 # reading these must tolerate a KeyError and report "—" rather than crash.
@@ -72,6 +82,14 @@ GAIL_TAGS = {
     "acc_fake":    "GAIL / Discriminator accuracy (fake)",
     "acc_probe":   "GAIL / Discriminator accuracy (probe, unseen GT)",
     "mem_gap":     "GAIL / Memorisation gap (bank - probe)",
+}
+
+# (D)-only rollout scalars, written by src/train.py when `w_mse > 0`. Absent from
+# every (A)/(B)/(C) event file, so readers must tolerate a KeyError.
+MSE_TAGS = {
+    "mse":         "Reward / MSE vs GT",
+    "mse_lifted":  "Reward / MSE vs GT, lifted",
+    "mse_improve": "Reward / MSE improvement over lifted",
 }
 
 TAGS = {
@@ -303,7 +321,9 @@ def _ms(xs: list[float], fmt: str = "{:.3f}") -> str:
 def table_diagnostics(sweep: Path, seeds: list[int], window: int,
                       heldout: Path | None, h5_path: str | None = None,
                       gail_dir: Path | None = None,
-                      heldout_gail: Path | None = None) -> None:
+                      heldout_gail: Path | None = None,
+                      mse_dir: Path | None = None,
+                      heldout_mse: Path | None = None) -> None:
     """The (A)/(B)/(C) diagnostics table.
 
     Columns are `(run_dir, variant, label)` triples rather than a bare variant
@@ -315,6 +335,8 @@ def table_diagnostics(sweep: Path, seeds: list[int], window: int,
     cols: list[tuple[Path, str, str]] = [(sweep, v, VARIANTS[v]) for v in VARIANTS]
     if gail_dir is not None:
         cols += [(gail_dir, v, lbl) for v, lbl in GAIL_RUNS.items()]
+    if mse_dir is not None:
+        cols += [(mse_dir, v, lbl) for v, lbl in D_RUNS.items()]
 
     def series(tag: str) -> list[list[float]]:
         return [_series(d, v, seeds, tag, window) for d, v, _ in cols]
@@ -335,6 +357,10 @@ def table_diagnostics(sweep: Path, seeds: list[int], window: int,
                 out.append([])
         return out
 
+    mse_l = gail_series(MSE_TAGS["mse"])
+    mse_b = gail_series(MSE_TAGS["mse_lifted"])
+    mse_i = gail_series(MSE_TAGS["mse_improve"])
+
     disc_r = gail_series(GAIL_TAGS["disc_reward"])
     disc_i = gail_series(GAIL_TAGS["disc_improve"])
     disc_s = gail_series(GAIL_TAGS["disc_scaled"])
@@ -350,7 +376,7 @@ def table_diagnostics(sweep: Path, seeds: list[int], window: int,
     # Both held-out dumps are keyed by run name ("frozen_s42", "feet_out_s42"),
     # so merging them into one lookup keeps the row source-agnostic.
     raw: dict = {}
-    for src in (heldout, heldout_gail):
+    for src in (heldout, heldout_gail, heldout_mse):
         if src and src.exists():
             raw.update(json.load(open(src)))
     ho = [[raw[f"{v}_s{sd}"]["pose/img_improvement_px"]
@@ -361,7 +387,7 @@ def table_diagnostics(sweep: Path, seeds: list[int], window: int,
     # With no --gail_dir the table keeps its trailing, empty "(C)" column, so
     # the (B)-only output is unchanged; with one, that placeholder is replaced
     # by the two real (C) columns.
-    pad = [] if gail_dir is not None else [""]
+    pad = [] if (gail_dir is not None or mse_dir is not None) else [""]
     labels = [l for _, _, l in cols] + (["(C)"] if pad else [])
     print("| Metric | Unit | (A) | " + " | ".join(labels) + " |")
     print("|---" * (len(labels) + 3) + "|")
@@ -385,6 +411,10 @@ def table_diagnostics(sweep: Path, seeds: list[int], window: int,
                 else f"{lifted_smoothness(h5_path):.4f}")
     row("Smoothness reward `exp(-a/sigma^2)`", "dimensionless, (0, 1]",
         a_smooth, [_ms(x, "{:.4f}") for x in smooth])
+    gail_row("MSE to GT, corrected", "normalised pose units^2", mse_l, "{:.4f}")
+    gail_row("MSE to GT, lifted (same rollout)", "normalised pose units^2",
+             mse_b, "{:.4f}")
+    gail_row("MSE improvement over lifted", "higher better", mse_i, "{:+.5f}")
     gail_row("Discriminator reward `amp_reward(D)`, train rollout",
              "dimensionless, [0, 1]", disc_r)
     gail_row("Discriminator reward, improvement over lifted",
@@ -451,6 +481,12 @@ def main() -> None:
     p.add_argument("--gail_dir", default=None,
                    help="run directory for the (C) arms (checkpoints/gail_c); "
                         "adds their columns to the diagnostics table")
+    p.add_argument("--mse_dir", default=None,
+                   help="run directory for the (D) arms (checkpoints/exp_d); "
+                        "adds their columns to the diagnostics table")
+    p.add_argument("--heldout_mse", default=None,
+                   help="JSON from scripts/heldout_eval.py --dump for the (D) "
+                        "arms, to fill their held-out row")
     p.add_argument("--heldout_gail", default=None,
                    help="JSON from scripts/heldout_eval.py --dump for the (C) "
                         "arms, to fill their held-out row")
@@ -466,7 +502,9 @@ def main() -> None:
         table_diagnostics(Path(a.sweep_dir), a.seeds, a.window,
                           Path(a.heldout) if a.heldout else None, a.h5_path,
                           Path(a.gail_dir) if a.gail_dir else None,
-                          Path(a.heldout_gail) if a.heldout_gail else None)
+                          Path(a.heldout_gail) if a.heldout_gail else None,
+                          Path(a.mse_dir) if a.mse_dir else None,
+                          Path(a.heldout_mse) if a.heldout_mse else None)
     elif a.table == "rollout":
         table_rollout(Path(a.sweep_dir), a.seeds, a.window, a.runs)
     elif a.table == "pampjpe":

@@ -71,6 +71,21 @@ class PPOWithPoseViz(PPO):
             self.track_data("Reward / reprojection", float(info["r_reproj"]))
         if ok(info.get("r_smooth")):
             self.track_data("Reward / smoothness", float(info["r_smooth"]))
+        # Experiment (D). Absent from an (A)/(B) run's info dict, so these three
+        # curves simply do not appear there rather than logging zeros.
+        #   level       — how far the corrected pose is from GT
+        #   lifted      — how far its own input was, the term's baseline
+        #   improvement — lifted - corrected, positive when the policy closed
+        #                 some of that gap. This is the one to watch: the level
+        #                 alone falls as the clip gets easier, not as the policy
+        #                 gets better.
+        if ok(info.get("r_mse")):
+            self.track_data("Reward / MSE vs GT", float(info["r_mse"]))
+        if ok(info.get("r_mse_lifted")):
+            self.track_data("Reward / MSE vs GT, lifted", float(info["r_mse_lifted"]))
+        if ok(info.get("r_mse_improvement")):
+            self.track_data("Reward / MSE improvement over lifted",
+                            float(info["r_mse_improvement"]))
         if ok(info.get("err_px")):
             self.track_data("Reprojection / error corrected (px)", float(info["err_px"]))
             self.track_data("Reprojection / joints scored", float(info.get("n_joints", 0)))
@@ -178,6 +193,9 @@ class Config:
     reward_mode:  str   = "gt"
     reproj_path:  str   = "data/reproj_targets.h5"
     w_reproj:     float = 1.0
+    # Experiment (D): weight on the supervised MSE-to-GT term. 0 keeps the
+    # reward ground-truth-free and reproduces (B).
+    w_mse:        float = 0.0
     # Retuned after the keypoint-bias correction. `exp(-e^2/s^2)` is steepest at
     # e = s/sqrt(2), so sigma should sit at operating_point * sqrt(2). Removing
     # the systematic COCO<->SMPL-X offset drops the held-out operating point from
@@ -267,7 +285,8 @@ def train(cfg: Config) -> None:
             # translation directly, so the virtual-camera path stays off.
             correct_translation=False,
         )
-        print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness — no GT"
+        print(f"Reward: reprojection (sigma={cfg.reproj_sigma}) + smoothness"
+              + (" + supervised MSE to GT" if cfg.w_mse else " — no GT")
               + (f", keypoint bias from {cfg.kp_bias_path}" if cfg.kp_bias_path
                  else ", NO keypoint-bias correction"))
     else:
@@ -282,6 +301,7 @@ def train(cfg: Config) -> None:
         reward_mode=cfg.reward_mode,
         reproj_reward=reproj_reward,
         w_reproj=cfg.w_reproj,
+        w_mse=cfg.w_mse,
         baseline_every=cfg.baseline_every,
         trans_mode=cfg.trans_mode,
         reward_baseline=cfg.reward_baseline,
@@ -300,6 +320,13 @@ def train(cfg: Config) -> None:
     if gym_env.reward_mode == "reproj":
         print("Reward: " + ("improvement over the lifted pose (baselined)"
                             if gym_env.reward_baseline else "absolute level (no baseline)"))
+        # Say it out loud. The difference between (B) and (D) is one number that
+        # is easy to leave at its default or to set by accident, and it changes
+        # whether the run is supervised.
+        print(f"        terms: reprojection (w={gym_env.w_reproj:g}) "
+              f"+ smoothness (w={gym_env.w_smoothness:g})"
+              + (f" + MSE vs GT (w={gym_env.w_mse:g})  <-- SUPERVISED, experiment (D)"
+                 if gym_env.w_mse else "  — ground-truth-free"))
     gym_env.reset(seed=cfg.seed)
     env = wrap_env(gym_env)
 
@@ -486,6 +513,11 @@ def main() -> None:
                         help="'reproj' is the GT-free reward for experiments (B)/(C)")
     parser.add_argument("--reproj_path",         default="data/reproj_targets.h5")
     parser.add_argument("--w_reproj",            type=float, default=1.0)
+    parser.add_argument("--w_mse",               type=float, default=0.0,
+                        help="experiment (D): weight on the supervised "
+                             "MSE(corrected, GT) term added to the reprojection "
+                             "reward. 0 (default) keeps the reward GT-free and "
+                             "reproduces (B).")
     parser.add_argument("--reproj_sigma",        type=float, default=0.0225,
                         help="reward width in bbox-height units; tuned to the "
                              "bias-corrected operating point (see Config)")
