@@ -10,7 +10,7 @@ Three experiments:
 |---|---|
 | **A** | SMPLer-X baseline, no correction |
 | **B** | PPO with reprojection + smoothness rewards |
-| **C** | PPO with the full AMP reward, including the GAIL discriminator |
+| **C** | PPO + GAIL discriminator |
 
 See `follow-up-on-gustaf-questions.md` for the full record of what was verified,
 what was fixed, and the measurements behind each decision.
@@ -118,12 +118,3 @@ python -m src.evaluate --processed_h5 data/processed_movi.h5 \
 # tests  (pyproject sets body_visualizer coverage flags, so override addopts)
 python -m pytest tests/test_reproject.py tests/test_rewards.py -o addopts=""
 ```
-
-## Notes
-
-- **Rewards must not use ground truth.** `reward_mode="gt"` exists for ablations
-  only; it is a supervised objective. Experiments (B) and (C) use
-  `reward_mode="reproj"`, which reads only image evidence.
-- **Splits are subject-disjoint** — 68 / 9 / 9 subjects across train / val / test.
-- The repo root also vendors `body_visualizer/`, `smplx-main/` and `smpler-x-main/`,
-  none of which are part of this project's source.
