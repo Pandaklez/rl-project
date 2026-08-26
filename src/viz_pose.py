@@ -224,6 +224,138 @@ class PoseVizLogger:
                 self.actor.train()
 
 
+class SupervisedPoseVizLogger:
+    """
+    `PoseVizLogger`'s sibling for `src.models.supervised.SupervisedPoseRegressor`
+    (experiment (E)) — same three-skeleton grid, same `__call__` /
+    `correction_magnitude` interface, so `src.train_supervised` can log it the
+    same way `PPOWithPoseViz` logs `PoseVizLogger`.
+
+    The reason this cannot just *be* `PoseVizLogger` with a different actor:
+    `PoseVizLogger._rollout` goes through `src.env.rollout_policy`, which steps
+    an env and expects a `PoseActor`-shaped policy (`.act()`/`.distribution()`,
+    `corrected_{t-1}` fed back as part of the observation). The supervised
+    regressor is a plain stateless `forward(lifted_pose) -> corrected_pose` —
+    no env, no action, no recurrence — so there is nothing for `rollout_policy`
+    to step through. `_rollout` here is the direct replacement: call the model
+    once on every frame of the clip.
+    """
+
+    def __init__(self, dataset, model, norm_stats, device="cpu",
+                 n_clips=3, n_frames=4, max_steps=120, seed=0):
+        self.dataset = dataset
+        self.model = model
+        self.norm_stats = norm_stats
+        self.device = torch.device(device)
+        self.n_frames = n_frames
+        self.max_steps = max_steps
+        rng = np.random.default_rng(seed)
+        n = min(n_clips, len(dataset))
+        self.sample_ids = sorted(rng.choice(len(dataset), size=n, replace=False).tolist())
+
+    @torch.no_grad()
+    def _rollout(self, idx):
+        """Return (lifted, corrected, gt) unnormalized pose sequences, (T, 22, 3)."""
+        sample = self.dataset[idx]
+        x, y = sample["x"], sample["y"]
+        T = min(self.max_steps, y["poses"].shape[0])
+        if T < 1:
+            return None
+
+        lifted_n = x["poses"][:T].to(self.device)     # (T, 22, 3), normalised
+        corr_n   = self.model(lifted_n).cpu()          # (T, 22, 3), normalised
+        lift_n   = lifted_n.cpu()
+        gt_n     = y["poses"][:T].cpu()
+
+        # Same unnormalisation split as PoseVizLogger, for the same reason: the
+        # lifted cameras and GT are normalised with different stats, and the
+        # model's output lives in the *lifted* space (see
+        # `SupervisedPoseRegressor`'s docstring), so it is unnormalised with the
+        # lifted stats, not the GT ones.
+        lifted_stats = load_lifted_stats(sample["meta"]["camera"])
+        out = [_unscale_seq(lift_n, lifted_stats),
+               _unscale_seq(corr_n, lifted_stats),
+               unnormalize(gt_n, "poses", self.norm_stats)]
+        return out
+
+    @torch.no_grad()
+    def __call__(self):
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            rows = []
+            for idx in self.sample_ids:
+                r = self._rollout(idx)
+                if r is not None:
+                    rows.append(r)
+            if not rows:
+                return None
+
+            n_rows, n_cols = len(rows), self.n_frames
+            fig, axes = plt.subplots(n_rows, n_cols,
+                                     figsize=(2.6 * n_cols, 3.0 * n_rows), squeeze=False)
+
+            for r, (lift, corr, gt) in enumerate(rows):
+                T = lift.shape[0]
+                frames = np.linspace(0, T - 1, n_cols).round().astype(int)
+                joints = {
+                    name: joints_from_poses(seq[frames], device=str(self.device)).numpy()
+                    for name, seq in (("lifted", lift), ("corrected", corr), ("gt", gt))
+                }
+                for c in range(n_cols):
+                    ax = axes[r][c]
+                    for name in ("lifted", "gt", "corrected"):
+                        j = joints[name][c]
+                        _draw(ax, np.stack([j[:, 0], j[:, 2]], axis=1), STYLES[name])
+                    px, pz = joints["gt"][c][0, 0], joints["gt"][c][0, 2]
+                    ax.set_xlim(px - HALF_RANGE, px + HALF_RANGE)
+                    ax.set_ylim(pz - HALF_RANGE, pz + HALF_RANGE)
+                    ax.set_aspect("equal")
+                    ax.set_xticks([]); ax.set_yticks([])
+                    for s in ax.spines.values():
+                        s.set_alpha(0.2)
+                    if r == 0:
+                        ax.set_title(f"t={frames[c]}", fontsize=8)
+                    if c == 0:
+                        ax.set_ylabel(f"clip {self.sample_ids[r]}", fontsize=8)
+
+            handles = [plt.Line2D([], [], color=c, linestyle=ls, label=n)
+                       for n, (c, ls, _) in STYLES.items()]
+            fig.legend(handles=handles, loc="lower center", ncol=3, frameon=False, fontsize=9)
+            fig.tight_layout(rect=(0, 0.04, 1, 1))
+            return fig
+        finally:
+            if was_training:
+                self.model.train()
+
+    @torch.no_grad()
+    def correction_magnitude(self):
+        """Mean |corrected - lifted| and |corrected - gt| in radians — see
+        `PoseVizLogger.correction_magnitude`, identical definition."""
+        was_training = self.model.training
+        self.model.eval()
+        try:
+            d_lift, d_gt, d_base = [], [], []
+            for idx in self.sample_ids:
+                r = self._rollout(idx)
+                if r is None:
+                    continue
+                lift, corr, gt = r
+                d_lift.append((corr - lift).abs().mean().item())
+                d_gt.append((corr - gt).abs().mean().item())
+                d_base.append((lift - gt).abs().mean().item())
+            if not d_lift:
+                return {}
+            return {
+                "pose/delta_from_lifted": float(np.mean(d_lift)),
+                "pose/err_corrected_vs_gt": float(np.mean(d_gt)),
+                "pose/err_lifted_vs_gt": float(np.mean(d_base)),
+            }
+        finally:
+            if was_training:
+                self.model.train()
+
+
 # ─── Image-plane visualisation ────────────────────────────────────────────────
 
 # Confidence below this and a ViTPose keypoint is not drawn — matches the gate

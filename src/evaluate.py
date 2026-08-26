@@ -35,6 +35,7 @@ import torch
 from src.data.datasets import MoViDataset, gt_group
 from src.env import rollout_policy
 from src.models.policy import PoseActor, trans_mode_from_width
+from src.models.supervised import SupervisedPoseRegressor
 from src.smplx_fk import joints_from_poses
 
 
@@ -327,6 +328,74 @@ def eval_model(
             "per_clip_keys": corrected_keys}
 
 
+# ─── Mode 3: supervised regression benchmark ──────────────────────────────────
+
+@torch.no_grad()
+def eval_supervised_model(
+    model:         SupervisedPoseRegressor,
+    dataset:       MoViDataset,
+    norm_stats:    dict,
+    device:        torch.device,
+    joint_set:     str  = "all22",
+    betas_source:  str  = "gt",
+) -> dict:
+    """
+    PA-MPJPE of the supervised regressor's output against GT.
+
+    Unlike `eval_model`, there is no rollout: `SupervisedPoseRegressor` is a
+    plain per-frame function of the lifted pose alone (no `corrected_{t-1}`,
+    no reprojection evidence), so a whole clip is corrected in one forward
+    pass instead of being stepped through `src.env`.
+
+    Mirrors `eval_model`'s unnormalisation exactly, for the same reason: the
+    model's output lives in *lifted*-per-camera-normalised space, not GT
+    space (see `SupervisedPoseRegressor`'s docstring) — so it is unnormalised
+    with the *lifted* stats and GT with `norm_stats`, never swapped.
+    """
+    from src.rewards import load_lifted_stats
+
+    model.eval()
+
+    corrected_scores: list[float] = []
+    corrected_keys: list[str] = []
+
+    for idx in range(len(dataset)):
+        sample = dataset[idx]
+        camera = sample["meta"]["camera"]
+        clip_key = f'{sample["meta"]["clip"]}__{camera.upper()}'
+
+        lifted_n = sample["x"]["poses"].to(device)   # (T, 22, 3), normalised
+        corr_n   = model(lifted_n).cpu()             # (T, 22, 3), normalised
+
+        lifted_stats = dict(load_lifted_stats(camera))
+        l_mu, l_sigma = lifted_stats["poses"]
+        corr = corr_n * torch.as_tensor(l_sigma).reshape(-1, 3) \
+                       + torch.as_tensor(l_mu).reshape(-1, 3)
+        gt = unnormalize_t(sample["y"]["poses"].cpu(), "poses", norm_stats)
+
+        gt_betas = unnormalize_t(sample["y"]["betas"].cpu(), "betas", norm_stats)
+        if betas_source == "gt":
+            pred_betas = gt_betas
+        else:
+            b_mu, b_sigma = lifted_stats["betas"]
+            pred_betas = sample["x"]["betas"].cpu() * torch.as_tensor(b_sigma) \
+                         + torch.as_tensor(b_mu)
+
+        corrected_scores.append(pa_mpjpe(
+            select_joints(joints_from_poses(corr, pred_betas, device=str(device)), joint_set),
+            select_joints(joints_from_poses(gt, gt_betas, device=str(device)), joint_set),
+        ))
+        corrected_keys.append(clip_key)
+
+        if (idx + 1) % 20 == 0:
+            print(f"  [supervised {idx+1:4d}/{len(dataset)}]  PA-MPJPE={np.mean(corrected_scores):.5f}")
+
+    return {"pa_mpjpe_corrected": float(np.mean(corrected_scores)),
+            "n_clips_model": len(dataset),
+            "per_clip_corrected": [float(v) for v in corrected_scores],
+            "per_clip_keys": corrected_keys}
+
+
 # ─── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -340,6 +409,12 @@ def main() -> None:
     parser.add_argument("--cameras",    nargs="+", default=["PG1", "PG2"])
     parser.add_argument("--checkpoint", default=None,
                         help="Actor checkpoint .pt for model evaluation (optional)")
+    parser.add_argument("--supervised_checkpoint", default=None,
+                        help="SupervisedPoseRegressor checkpoint .pt from "
+                             "src.train_supervised (optional). Mutually "
+                             "exclusive with --checkpoint — both write the "
+                             "same result keys, since they answer the same "
+                             "question against the same (A) baseline.")
     parser.add_argument("--split",  default="test")
     parser.add_argument("--joint_set", choices=tuple(JOINT_SETS), default="all22",
                         help="joints the error is averaged over. 'all22' is every "
@@ -360,8 +435,13 @@ def main() -> None:
                              "so conditions can be compared pairwise on the same clips")
     args = parser.parse_args()
 
-    if args.lifted_h5 is None and args.checkpoint is None:
-        parser.error("Provide --lifted_h5 for baseline, --checkpoint for model eval, or both.")
+    if args.lifted_h5 is None and args.checkpoint is None and args.supervised_checkpoint is None:
+        parser.error("Provide --lifted_h5 for baseline, --checkpoint or "
+                      "--supervised_checkpoint for model eval, or both a "
+                      "baseline and one model.")
+    if args.checkpoint and args.supervised_checkpoint:
+        parser.error("--checkpoint and --supervised_checkpoint both write "
+                      "'pa_mpjpe_corrected' — run them separately.")
 
     with open(args.norm_stats_path) as f:
         norm_stats = json.load(f)
@@ -372,7 +452,13 @@ def main() -> None:
 
     # ── Lifted baseline ───────────────────────────────────────────────────────
     if args.lifted_h5:
-        print(f"\n── Raw lifted baseline (GT from {args.processed_h5}, unnormalized) ──")
+        # ASCII "--", not the U+2500 box-drawing dash: Windows' console defaults
+        # to the cp1252 codepage, which has no glyph for it and raises
+        # UnicodeEncodeError on print (same issue src/train.py's "->" comment
+        # documents for U+2192 — cp1252 does *not* choke on "—" or "±", only on
+        # box-drawing and arrow glyphs, which is why those two are singled out
+        # here rather than every non-ASCII character in this file).
+        print(f"\n-- Raw lifted baseline (GT from {args.processed_h5}, unnormalized) --")
         res = eval_lifted_baseline(
             args.lifted_h5, args.processed_h5,
             norm_stats, tuple(args.cameras), args.split, args.device,
@@ -404,7 +490,7 @@ def main() -> None:
                           use_evidence=use_evidence,
                           state_trans=state_trans).to(device)
         actor.load_state_dict(ckpt["actor"])
-        print(f"\n── Model: {args.checkpoint} ──")
+        print(f"\n-- Model: {args.checkpoint} --")
         print(f"  Action: {act_dim}-d (trans_mode={trans_mode})")
         print(f"  Observation: {actor.net[0].in_features}-d "
               f"({'poses' if not state_trans else 'poses + trans'}"
@@ -429,6 +515,25 @@ def main() -> None:
                          reproj_reward=reproj_reward, use_evidence=use_evidence,
                          trans_mode=trans_mode, state_trans=state_trans,
                          joint_set=args.joint_set, betas_source=args.betas_source)
+        all_results.update(res)
+        print(f"  PA-MPJPE corrected     : {res['pa_mpjpe_corrected']:.5f}  ({res['n_clips_model']} clips)")
+
+    # ── Supervised regression benchmark ──────────────────────────────────────
+    if args.supervised_checkpoint:
+        device = torch.device(args.device)
+        ckpt = torch.load(args.supervised_checkpoint, map_location=device)
+        cfg  = ckpt["config"]
+
+        model = SupervisedPoseRegressor(hidden_dims=tuple(cfg["hidden_dims"])).to(device)
+        model.load_state_dict(ckpt["model"])
+        print(f"\n-- Supervised regressor: {args.supervised_checkpoint} --")
+
+        dataset = MoViDataset(args.processed_h5, args.norm_stats_path,
+                              split=args.split, verbose=True)
+        print(f"  Clips: {len(dataset)}")
+
+        res = eval_supervised_model(model, dataset, norm_stats, device,
+                                    joint_set=args.joint_set, betas_source=args.betas_source)
         all_results.update(res)
         print(f"  PA-MPJPE corrected     : {res['pa_mpjpe_corrected']:.5f}  ({res['n_clips_model']} clips)")
 

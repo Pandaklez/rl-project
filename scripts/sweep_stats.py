@@ -66,9 +66,20 @@ GAIL_RUNS = {"feet_in": "(C) GAIL, feet in", "feet_out": "(C) GAIL, feet out"}
 D_VARIANTS = {"d_mse1": "(D) PPO + MSE, w=1", "d_mse10": "(D) PPO + MSE, w=10"}
 D_RUNS = {"mse1": "(D) MSE, w=1", "mse10": "(D) MSE, w=10"}
 
+# Experiment (E): the plain supervised regression benchmark
+# (`src/train_supervised.py`) -- no PPO, no rollout, no discriminator, just a
+# per-frame MLP trained by gradient descent against GT. `table_pampjpe` is the
+# only table that applies to it: there is no TensorBoard event file (no PPO
+# training loop to log from) and no `actor`/`log_std` keys in its checkpoint
+# (`{"model": ..., "config": ...}`, not skrl's actor format), so it cannot
+# feed `table_rollout`/`table_diagnostics`/`table_config`, which all read one
+# or the other. One name on disk, unlike (C)/(D): there is only one arm, so
+# `scripts/run_exp_e.sh`'s dumps are named `supervised_s<seed>.json` directly.
+E_VARIANTS = {"supervised": "(E) Supervised regression"}
+
 # Dump-prefix lookup for `table_pampjpe`; run-directory lookup for the tables
 # that read checkpoints and event files.
-PAMPJPE_VARIANTS = {**VARIANTS, **GAIL_VARIANTS, **D_VARIANTS}
+PAMPJPE_VARIANTS = {**VARIANTS, **GAIL_VARIANTS, **D_VARIANTS, **E_VARIANTS}
 RUN_LABELS = {**VARIANTS, **GAIL_RUNS, **D_RUNS}
 
 # GAIL-only rollout scalars. Absent from every (B) event file, so anything
@@ -203,8 +214,13 @@ def table_pampjpe(scores_dir: Path, seeds: list[int]) -> None:
           f"{any_run['n_clips_baseline']} clips | {base_374:.3f} mm over "
           f"{len(lifted)} clip-cameras\n")
 
+    # ASCII "delta", not U+0394: Windows' console defaults to the cp1252
+    # codepage and has no glyph for it (same class of issue as the box-drawing
+    # dashes fixed in src/evaluate.py — see that file's comment for why cp1252
+    # is fine with most non-ASCII, e.g. "±" and "—", and only chokes on a
+    # handful of glyphs like this one).
     print("| variant | " + " | ".join(f"s{s}" for s in seeds)
-          + " | mean ± sd | Δ vs lifted | clip-cameras improved |")
+          + " | mean ± sd | delta vs lifted | clip-cameras improved |")
     print("|---" * (len(seeds) + 4) + "|")
     print(f"| (A) lifted baseline | " + " | ".join(f"{base_374:.3f}" for _ in seeds)
           + f" | **{base_374:.3f}** | 0 *(by definition)* | — |")

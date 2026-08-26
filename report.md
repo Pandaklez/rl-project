@@ -44,12 +44,30 @@ the GT-vs-lifted reprojection comparison that motivates (C).
 > measured in the wrong space), and the discriminator reward is `amp_reward`, not
 > `sigmoid(D)`. See *(C) PPO + GAIL*.
 
+> **Condition (E) ran on 2026-08-26.** Three seeds (42/43/44) in
+> `checkpoints/exp_e/`, test-split dumps in `eval_scores/supervised_s*.json`.
+> (E) is not an RL policy — a plain per-frame MLP trained by direct supervised
+> regression against GT, no PPO, no reward, no discriminator, no rollout at
+> all (`src/train_supervised.py`; see *(E) Supervised regression* for why it
+> exists and how it differs from (D)). **It is the first condition in this
+> document to beat (A)**: 29.30 ± 0.20 mm against (A)'s 34.40 mm, a change of
+> sign and of section from every RL/GAIL result above. Every "no variant beats
+> doing nothing" statement elsewhere in this document was written before (E)
+> existed and is scoped to the RL/GAIL variants ((B)/(C)/(D)) — it is called
+> out explicitly wherever (E) makes it otherwise ambiguous.
+
 ## Primary metric
 
-| | (A) SMPLer-X, no correction | (B1) PPO, trans frozen | (B2) PPO, du,dv image shift | (B3) PPO, pose-only state | (C) PPO + GAIL, feet in | (C) PPO + GAIL, feet out |
-|---|---|---|---|---|---|---|
-| **PA-MPJPE, test (mm), lower is better** | **34.40** | 34.51 ± 0.03 | 34.50 ± 0.06 | 34.48 ± 0.06 | 34.45 ± 0.06 | 34.53 ± 0.03 |
-| **Δ vs (A), same clip-cameras (mm)** | 0 *(by definition)* | +0.119 ± 0.030 | +0.101 ± 0.057 | +0.084 ± 0.058 | +0.050 ± 0.055 | +0.138 ± 0.026 |
+| | (A) SMPLer-X, no correction | (B1) PPO, trans frozen | (B2) PPO, du,dv image shift | (B3) PPO, pose-only state | (C) PPO + GAIL, feet in | (C) PPO + GAIL, feet out | (E) Supervised regression |
+|---|---|---|---|---|---|---|---|
+| **PA-MPJPE, test (mm), lower is better** | **34.40** | 34.51 ± 0.03 | 34.50 ± 0.06 | 34.48 ± 0.06 | 34.45 ± 0.06 | 34.53 ± 0.03 | **29.30 ± 0.20** |
+| **Δ vs (A), same clip-cameras (mm)** | 0 *(by definition)* | +0.119 ± 0.030 | +0.101 ± 0.057 | +0.084 ± 0.058 | +0.050 ± 0.055 | +0.138 ± 0.026 | **-5.099 ± 0.196** |
+
+> (E) is a plain per-frame MLP trained by direct supervised regression, not an
+> RL policy — no reward, no discriminator, no rollout. It sits in this table
+> because it answers the same question as (B)/(C)/(D) (can the lifted pose be
+> corrected toward GT) with a different method, not because it belongs to the
+> same experiment family. See *(E) Supervised regression*.
 
 **Reproduce.**
 ```bash
@@ -71,14 +89,32 @@ for c in feet_in feet_out; do for sd in 42 43 44; do
     --checkpoint checkpoints/gail_c/${c}_s${sd}/actor_final.pt \
     --dump_scores eval_scores/gail_${c}_s${sd}.json
 done; done
+# 1c. (E) is not a checkpoint sweep -- one training script, one supervised
+#     regressor per seed. scripts/run_exp_e.sh runs exactly this end to end
+#     (train + eval, all 3 seeds), skipping any seed already done.
+for sd in 42 43 44; do
+  python -m src.evaluate --processed_h5 data/processed_movi.h5 \
+    --lifted_h5 lifted_movi_part1_upd2.h5 --joint_set j14 --split test --device cpu \
+    --supervised_checkpoint checkpoints/exp_e/s${sd}/regressor_final.pt \
+    --dump_scores eval_scores/supervised_s${sd}.json
+done
 # 2. aggregate, pairing each corrected score against its own clip-camera
 python scripts/sweep_stats.py --table pampjpe --scores_dir eval_scores
 ```
 
 The ± is the standard deviation over **three seeds** (42, 43, 44); see *Seed
-sweep* below for the per-seed values and the paired test. **No variant beats
-doing nothing — (C) included**, and the ordering is stable: every variant, at
-every seed, scores slightly worse than the uncorrected lifted pose.
+sweep* below for the per-seed values and the paired test. **No RL/GAIL variant
+in this document beats doing nothing — (B) and (C) included**, and the
+ordering among them is stable: every one, at every seed, scores slightly worse
+than the uncorrected lifted pose. (Experiment (D), PPO plus a supervised
+MSE-to-GT reward term, has code and a launcher — `scripts/run_exp_d.sh` — but
+no measured result in this document; it is not claimed to fail or to succeed,
+only that it has not been run to completion here.) **(E) is the exception to
+the pattern that does exist**: a plain supervised regressor, trained with no
+reward and no rollout at all, beats (A) by 5.1 mm. See *(E) Supervised
+regression* for why that is not a contradiction of the paragraphs above — it
+answers a different question (is there learnable signal at all) than (B)/(C)
+do (can PPO find it unsupervised).
 
 **(C) does not change that verdict, but it does move the number.** Adding the
 discriminator to the (B1) recipe takes the gap to (A) from +0.119 to
@@ -425,6 +461,14 @@ carries no aggregation difference.
 | (B3) pose-only | 34.416 | 34.529 | 34.494 | 34.480 ± 0.058 | +0.084 ± 0.058 | 40.1% |
 | (C) GAIL, feet in | 34.426 | 34.509 | 34.404 | **34.446 ± 0.055** | **+0.050 ± 0.055** | **45.5%** |
 | (C) GAIL, feet out | 34.505 | 34.556 | 34.541 | 34.534 ± 0.026 | +0.138 ± 0.026 | 34.2% |
+| (E) supervised regression | 29.071 | 29.429 | 29.389 | **29.297 ± 0.196** | **-5.099 ± 0.196** | **81.9%** |
+
+(E) is not a variant of (B)/(C)'s PPO recipe — no reward, no rollout, three
+seeds of a supervised regressor trained from scratch each time. It is included
+in this table because it is scored the same way, on the same clips, by the
+same `src.evaluate` code path, and dumped to the same `eval_scores/` format —
+not because it belongs to the same sweep. Full detail, training curves and
+discussion: *(E) Supervised regression*.
 
 **Reproduce.**
 ```bash
@@ -713,6 +757,116 @@ window, per `WINDOW` in `src/models/discriminator.py`), not fewer.
 
 ---
 
+## (E) Supervised regression
+
+Three seeds (42/43/44) in `checkpoints/exp_e/`, launched 2026-08-26 by
+`scripts/run_exp_e.sh`, test-split dumps in `eval_scores/supervised_s*.json`.
+
+**What it is, and why it exists.** (D) (`scripts/run_exp_d.sh`, `src/env.py`'s
+`w_mse` term) asks whether PPO can be handed a supervised MSE-to-GT signal
+*inside its reward* and use it. (D) has no measured result in this document
+(see the callout near the top) — but even if it did, a PPO run answers two
+questions at once and cannot separate them: "is there learnable signal in
+lifted-pose to GT-pose at all?" and "did this particular RL recipe find it?".
+(E) removes PPO, the reward, the discriminator and the rollout entirely and
+asks only the first question: train a plain feedforward regressor by direct
+gradient descent against GT, with nothing else in the objective, and see how
+far it gets. `src/models/supervised.py`'s module docstring states this
+motivation in the code itself.
+
+**Architecture.** `SupervisedPoseRegressor` — a per-frame MLP,
+`hidden_dims=(512, 256)`, the same capacity as `PoseActor` / (B3), 182,594
+parameters. Input is the lifted pose alone: 66-d, normalised, pose-only — no
+`trans`, no `betas`, no 2D evidence, and no `corrected_{t-1}` (that input only
+exists in the RL setup because the policy consumes its own previous rollout
+output; there is nothing analogous for a stateless per-frame regressor).
+Output is a residual delta added to the input, the same
+residual-around-the-lifted-pose parameterisation `PoseActor`'s action uses.
+Deliberately no recurrent variant yet — see *Reading these numbers* for why
+that was kept as a separate, later ablation rather than folded into this run.
+
+**Loss.** Plain MSE, computed in one shared normalised space rather than on
+the raw stored tensors. `data/processed_movi.h5` stores GT and lifted poses
+already normalised, but with *different* per-camera affine maps (GT with
+`data/normalization.json`, lifted with `data/normalization_lifted_pg{1,2}.json`)
+— the same mismatch `src/models/discriminator.py::PoseSpace` exists to fix for
+the GAIL discriminator (see *Training diagnostics*, and the 5.1 deg RMS / 31
+deg root bias a discriminator trained on the raw mismatch would reward). (D)'s
+`r_mse` reward term (`src/env.py::_apply_mse`) has this same mismatch and does
+not correct for it — tolerable there because it is baselined against
+`mse_lifted` computed the same mismatched way, so the bias mostly cancels in a
+*relative* reward; not tolerable for a loss that gradient descent is actually
+driven toward. `src/models/supervised.py::gt_space_mse` remaps the model's
+lifted-space output into GT-normalised space (`PoseSpace(exclude_joints=())`,
+all 22 joints — the GAIL discriminator's exclusion of joint 0 is a
+plausibility-scoring choice this regression loss has no reason to inherit)
+before taking the squared difference.
+
+**Training.** i.i.d. shuffled frames, not rollouts — nothing here needs PPO's
+on-policy trajectory structure, so every frame of every train clip is flattened
+into one big tensor set and trained with ordinary minibatch SGD: 1,894,445
+frames from 2,781 clip-cameras (train), 248,365 frames from 377 clip-cameras
+(val, diagnostic-only curve, never used for checkpoint or hyperparameter
+selection — same convention as everywhere else in this document). Adam,
+lr=1e-3, batch size 4096, 30 epochs, grad-norm clip 1.0, no weight decay.
+Trained on GPU; all three seeds finished training in about 3 minutes combined
+— evaluation (CPU, PA-MPJPE through forward kinematics on both the baseline
+and the corrected pose) was the actual bottleneck, at several minutes per
+seed. Full 3-seed train+eval sweep: about 19 minutes wall time end to end.
+
+**Result.**
+
+| variant | s42 | s43 | s44 | mean ± sd | Δ vs lifted | clip-cameras improved |
+|---|---|---|---|---|---|---|
+| (A) lifted baseline | 34.396 | 34.396 | 34.396 | **34.396** | 0 *(by definition)* | — |
+| (E) supervised regression | 29.071 | 29.429 | 29.389 | **29.297 ± 0.196** | **-5.099 ± 0.196** | **81.9%** |
+
+Paired per clip-camera over all 1,122 deltas (3 seeds x 374), one-sample
+t-test against zero: **t = -20.4**, in the *improving* direction — an order of
+magnitude further from zero than any (B)/(C) t-statistic in this report, and
+the across-seed spread (sd 0.196 mm) is a fraction of the effect size itself,
+unlike the (B3) seed-42 claim this document had to retract. This is not a
+borderline result at three seeds the way several (B)/(C) comparisons are.
+
+**Reproduce.**
+```bash
+bash scripts/run_exp_e.sh                                    # train + eval, all 3 seeds
+python scripts/sweep_stats.py --table pampjpe --scores_dir eval_scores
+```
+
+**What this does and does not say about (B)/(C).** (E) is not a better version
+of (B)/(C)'s recipe — it is not comparable to them as a competing method,
+because it is not solving the same problem. (B)/(C) are deliberately
+ground-truth-free (the entire point of the reprojection reward, per
+*Training diagnostics*'s `RMSE, corrected vs GT` row: "the `reward_mode='gt'`
+supervised objective, deliberately disabled for (B) and (C) so the reward
+stays ground-truth-free"). (E) is handed GT directly, at training time, for
+every frame. So (E)'s result is not evidence that PPO was solving the problem
+badly relative to some fixable ceiling near 34 mm — it is evidence that the
+ceiling itself, when GT is available at all, is far below 34 mm, close to
+29.3 mm. What (E) does say: the reprojection reward's own small
+GT-displacement (+0.31 px, see *Reading these numbers*) is very unlikely to be
+the reason (B)/(C) fail to improve on (A) — a signal that small could not
+plausibly be standing between a policy and a 5 mm gain. The bottleneck is more
+likely that the reprojection reward, even where it agrees with GT in
+direction, is simply a much weaker training signal for joint-angle accuracy
+than a direct per-frame GT gradient is. Whether (D)'s specific recipe (the
+same MSE term, folded into a PPO reward rather than trained directly) can
+recover any of this gap is the open question (D) was meant to answer and has
+not yet been run to completion to answer.
+
+**Monitoring.** `src/train_supervised.py` writes a TensorBoard event file into
+each seed's `out_dir` — `Loss/train (GT-space MSE)`, `Loss/val (...)`, and
+(every `--viz_interval` epochs, default 5) the same lifted/corrected/GT
+skeleton grid `src.train`'s PPO runs log, via
+`src/viz_pose.py::SupervisedPoseVizLogger` — a sibling of `PoseVizLogger` that
+calls the regressor directly on a few held-out clips instead of going through
+`src.env.rollout_policy` (the regressor is stateless, so there is no rollout
+to step through). `tensorboard --logdir checkpoints/exp_e` covers all three
+seeds.
+
+---
+
 ## Measurement convention
 
 **Joint set changes the headline by a third.** SMPL-X's 22 body joints include
@@ -817,8 +971,25 @@ discriminator to the (B1) recipe cuts the PA-MPJPE degradation from +0.119 to
 comparable to its own seed spread. Both are consistent with a reward that is
 mis-aimed by about a third of a pixel: a term that does not use the detector at
 all pulls the pose back toward GT, but not far enough to make correction pay.
-**No variant in this report beats doing nothing**, and (C) is worse than (A) at
-t = +4.3. See *(C) PPO + GAIL*.
+**No RL/GAIL variant beats doing nothing**, and (C) is worse than (A) at
+t = +4.3. See *(C) PPO + GAIL*. (This paragraph is about the reprojection
+reward specifically, which only (B)/(C) use — it says nothing about (E), which
+uses no reward at all. See *(E) Supervised regression*.)
+
+**(E) says the headroom was never small — the reprojection reward's own
+displacement from GT was.** Read together with the paragraph above: the
+reprojection reward is mis-aimed from GT by only +0.31 px, which rules out
+"the reward points the wrong way by a lot" as the reason (B)/(C) never beat
+(A). (E) rules out the other natural explanation — "there is not much signal
+to find" — directly: a plain supervised regressor with the same input, the
+same capacity as (B3), and no reward or rollout at all, closes 5.1 mm of the
+34.4 mm gap in one pass. So the ceiling was never close to (A); the reward
+(B)/(C) actually optimise is just a far weaker training signal for joint-angle
+accuracy than a direct GT gradient, independent of the small displacement
+above. That reframes what (D) was for: (D) is the one condition in this report
+that gives PPO access to exactly the signal (E) shows is this informative — it
+is the test of whether PPO can *use* it, not of whether it exists. (D) has not
+been run to completion in this document, so that question is still open.
 
 **Reproduce.** Scores the same clips as `heldout_eval.py` at the same
 `--clip_seed`; no policy is involved on either side.
